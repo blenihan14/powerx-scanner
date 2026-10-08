@@ -3,12 +3,16 @@ import yfinance as yf
 import pandas as pd
 import requests
 from datetime import datetime, date
+import math
+from scipy.stats import norm
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Page Configuration
 st.set_page_config(page_title="PowerX Pro Ultimate Scanner", layout="wide")
 
 st.title("⚡ PowerX Pro Ultimate Options Scanner & Risk Engine")
-st.markdown("Modular quantitative screening, risk sizing, earnings blockers, stress testing, and collapsible feature blocks.")
+st.markdown("Institutional-grade quantitative screening, interactive Plotly charts, Black-Scholes Greeks, ex-dividend risk, and CSV export.")
 
 # ==========================================
 # SIDEBAR: COLLAPSIBLE CONFIGURATION SECTIONS
@@ -55,6 +59,20 @@ if "scanned" not in st.session_state:
 
 if st.sidebar.button("Run Ultimate Scan", type="primary"):
     st.session_state.scanned = True
+
+# Helper function for Black-Scholes Put Delta & PoP
+def calculate_put_greeks(S, K, T_days, iv):
+    if T_days <= 0 or iv <= 0 or S <= 0 or K <= 0:
+        return 0.0, 50.0
+    T = T_days / 365.0
+    r = 0.045
+    try:
+        d1 = (math.log(S / K) + (r + 0.5 * (iv ** 2)) * T) / (iv * math.sqrt(T))
+        delta = norm.cdf(d1) - 1.0
+        pop = (1.0 - abs(delta)) * 100.0
+        return round(delta, 3), round(pop, 1)
+    except:
+        return 0.0, 50.0
 
 # ==========================================
 # MODE 1: BATCH MARKET SCREENER
@@ -118,6 +136,14 @@ if scan_mode == "⚡ Batch Market Screener (All Watchlist)":
             df_results = pd.DataFrame(results)
             st.dataframe(df_results, use_container_width=True)
             
+            csv_data = df_results.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Batch Scan Results (CSV)",
+                data=csv_data,
+                file_name="powerx_batch_scan.csv",
+                mime="text/csv",
+            )
+            
             passed_df = df_results[df_results["Scan Status"].str.contains("PASS")]
             if not passed_df.empty:
                 st.success(f"Found {len(passed_df)} qualifying asset(s) ready for review!")
@@ -125,7 +151,7 @@ if scan_mode == "⚡ Batch Market Screener (All Watchlist)":
                 st.info("No assets currently match the strict criteria on this timeframe.")
 
 # ==========================================
-# MODE 2: SINGLE TICKER DEEP DIVE WITH EXPANDERS
+# MODE 2: SINGLE TICKER DEEP DIVE
 # ==========================================
 elif scan_mode == "Single Ticker Deep Dive":
     if st.session_state.scanned:
@@ -137,9 +163,9 @@ elif scan_mode == "Single Ticker Deep Dive":
                 st.error(f"Insufficient historical data retrieved for {selected_ticker} using period {hist_period}.")
             else:
                 current_price = hist['Close'].iloc[-1]
-                delta = hist['Close'].diff()
-                gain = (delta.where(delta > 0, 0)).rolling(window=rsi_window).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_window).mean()
+                delta_price = hist['Close'].diff()
+                gain = (delta_price.where(delta_price > 0, 0)).rolling(window=rsi_window).mean()
+                loss = (-delta_price.where(delta_price < 0, 0)).rolling(window=rsi_window).mean()
                 rs = gain / loss
                 hist['RSI'] = 100 - (100 / (1 + rs))
                 
@@ -161,7 +187,19 @@ elif scan_mode == "Single Ticker Deep Dive":
                 except:
                     pass
 
-                # Section 1: Technical Metrics & Status (Collapsible)
+                ex_div_date_str = "None found"
+                ex_div_warning = False
+                try:
+                    info = stock.info
+                    ex_timestamp = info.get('exDividendDate')
+                    if ex_timestamp:
+                        ex_date = pd.to_datetime(ex_timestamp, unit='s').date()
+                        ex_div_date_str = ex_date.strftime('%Y-%m-%d')
+                        if 0 <= (ex_date - date.today()).days <= 30:
+                            ex_div_warning = True
+                except:
+                    pass
+
                 with st.expander(f"📈 Technical Indicators & Metrics: {selected_ticker}", expanded=True):
                     col1, col2, col3, col4 = st.columns(4)
                     col1.metric("Live Market Price", f"${current_price:.2f}")
@@ -171,6 +209,11 @@ elif scan_mode == "Single Ticker Deep Dive":
                     
                     if earnings_warning:
                         st.error("🚨 **EARNINGS CATALYST WARNING**: This asset reports earnings within the next 14 days. Avoid selling options through binary events!")
+                    
+                    if ex_div_warning:
+                        st.warning(f"⚠️ **EX-DIVIDEND WARNING**: Ex-dividend date is **{ex_div_date_str}**. Covered call traders face early assignment risk if ITM!")
+                    else:
+                        st.info(f"📅 Next Ex-Dividend Date: {ex_div_date_str}")
 
                     near_support = current_price <= (support_level * 1.03)
                     rsi_pullback = 30 <= current_rsi <= 55
@@ -183,34 +226,75 @@ elif scan_mode == "Single Ticker Deep Dive":
                     else:
                         st.warning("🟡 **Setup WATCH**: Technical criteria not fully aligned or blocked by upcoming earnings.")
 
-                # Section 2: Options Chain & Position Sizing Calculator (Collapsible)
-                with st.expander("📊 Options Chain & Position Sizing Calculator", expanded=True):
+                with st.expander(f"📉 Interactive Price & RSI Chart ({selected_ticker})", expanded=True):
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                        vertical_spacing=0.05, row_heights=[0.7, 0.3])
+                    
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], mode='lines', name='Close Price', line=dict(color='blue', width=2)), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Support'], mode='lines', name=f'{support_window}D Support', line=dict(color='green', dash='dash')), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Resistance'], mode='lines', name=f'{support_window}D Resistance', line=dict(color='red', dash='dash')), row=1, col=1)
+                    
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], mode='lines', name=f'RSI ({rsi_window})', line=dict(color='purple', width=1.5)), row=2, col=1)
+                    fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
+                    fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
+                    
+                    fig.update_layout(height=500, margin=dict(l=10, r=10, t=10, b=10), template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with st.expander("📊 Options Chain, Delta & Position Sizing Calculator", expanded=True):
                     try:
                         exp_dates = stock.options
                         if exp_dates and len(exp_dates) > 0:
-                            target_date = exp_dates[0]
+                            target_date = st.selectbox("Select Expiration Date", exp_dates, key="target_exp_date")
                             opt_chain = stock.option_chain(target_date)
                             puts = opt_chain.puts
                             
                             if not puts.empty:
+                                exp_dt = datetime.strptime(target_date, "%Y-%m-%d").date()
+                                dte = (exp_dt - date.today()).days
+                                if dte <= 0:
+                                    dte = 1
+                                    
                                 otm_puts = puts[puts['strike'] < support_level].copy()
                                 if otm_puts.empty:
                                     otm_puts = puts[puts['strike'] < current_price * 0.95].copy()
                                 if otm_puts.empty:
                                     otm_puts = puts.copy()
                                     
+                                deltas = []
+                                pops = []
+                                for idx, row in otm_puts.iterrows():
+                                    iv = row.get('impliedVolatility', 0.3)
+                                    if pd.isna(iv) or iv == 0:
+                                        iv = 0.3
+                                    d, p = calculate_put_greeks(current_price, row['strike'], dte, iv)
+                                    deltas.append(d)
+                                    pops.append(p)
+                                    
+                                otm_puts['Delta'] = deltas
+                                otm_puts['PoP_%'] = pops
                                 otm_puts['Yield_%'] = (otm_puts['bid'] / otm_puts['strike']) * 100
+                                
                                 max_capital_allowed = account_size * (max_risk_pct / 100.0)
                                 otm_puts['Max_Contracts'] = (max_capital_allowed / (otm_puts['strike'] * 100)).astype(int)
                                 otm_puts['Total_Collateral'] = otm_puts['strike'] * otm_puts['Max_Contracts'] * 100
                                 otm_puts['Potential_Premium'] = otm_puts['bid'] * otm_puts['Max_Contracts'] * 100
                                 
-                                display_cols = ['strike', 'bid', 'ask', 'impliedVolatility', 'volume', 'Yield_%', 'Max_Contracts', 'Total_Collateral', 'Potential_Premium']
+                                display_cols = ['strike', 'bid', 'ask', 'impliedVolatility', 'Delta', 'PoP_%', 'volume', 'Yield_%', 'Max_Contracts', 'Total_Collateral', 'Potential_Premium']
                                 
-                                st.caption(f"Calculated for max risk allocation: **${max_capital_allowed:,.2f}** ({max_risk_pct}% of account) | Expiry: {target_date}")
+                                st.caption(f"Calculated for max risk allocation: **${max_capital_allowed:,.2f}** ({max_risk_pct}% of account) | DTE: {dte} days")
+                                
                                 st.dataframe(
                                     otm_puts[display_cols].sort_values(by='bid', ascending=False),
                                     use_container_width=True
+                                )
+                                
+                                chain_csv = otm_puts[display_cols].to_csv(index=False).encode('utf-8')
+                                st.download_button(
+                                    label="📥 Download Options Chain & Sizing (CSV)",
+                                    data=chain_csv,
+                                    file_name=f"{selected_ticker}_options_chain.csv",
+                                    mime="text/csv",
                                 )
                             else:
                                 st.info("Yahoo Finance returned an empty options chain for this ticker right now.")
@@ -219,7 +303,6 @@ elif scan_mode == "Single Ticker Deep Dive":
                     except Exception as e:
                         st.warning(f"Unable to fetch live options chain due to Yahoo Finance rate limits: {e}")
 
-                # Section 3: Interactive What-If Stress Tester (Collapsible)
                 with st.expander("🧪 Interactive 'What-If' Stress Tester (Short Put Simulation)", expanded=True):
                     st.caption("Simulate adverse market moves on your portfolio risk.")
                     col_s1, col_s2 = st.columns(2)
