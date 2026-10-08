@@ -7,12 +7,14 @@ import math
 from scipy.stats import norm
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import gspread
+from google.oauth2.service_account import Credentials
 
 # Page Configuration
 st.set_page_config(page_title="PowerX Pro Ultimate Scanner", layout="wide")
 
 st.title("⚡ PowerX Pro Ultimate Options Scanner & Risk Engine")
-st.markdown("Institutional-grade quantitative screening, interactive Plotly charts, Black-Scholes Greeks, ex-dividend risk, and CSV export.")
+st.markdown("Institutional-grade quantitative screening, interactive Plotly charts, Black-Scholes Greeks, ex-dividend risk, and Google Sheets journaling.")
 
 # ==========================================
 # SIDEBAR: COLLAPSIBLE CONFIGURATION SECTIONS
@@ -31,10 +33,10 @@ with st.sidebar.expander("🎛️ Technical Indicator Settings", expanded=False)
 with st.sidebar.expander("🔍 Scanner Mode & Watchlist", expanded=True):
     scan_mode = st.radio("Select Mode", ["Single Ticker Deep Dive", "⚡ Batch Market Screener (All Watchlist)"])
     DEFAULT_WATCHLIST = ["VTI", "VOO", "SPY", "QQQ", "MU", "MO", "HD", "AAPL", "NVDA", "TSLA", "AMD"]
-    custom_ticker_input = st.text_input("Add Custom Ticker", "").upper().strip()
+    custom_ticker_input = st.sidebar.text_input("Add Custom Ticker", "").upper().strip()
     if custom_ticker_input and custom_ticker_input not in DEFAULT_WATCHLIST:
         DEFAULT_WATCHLIST.append(custom_ticker_input)
-    selected_ticker = st.selectbox("Select Target Ticker (Single Mode)", DEFAULT_WATCHLIST)
+    selected_ticker = st.sidebar.selectbox("Select Target Ticker (Single Mode)", DEFAULT_WATCHLIST)
 
 with st.sidebar.expander("🔔 Webhook Alerts", expanded=False):
     notification_type = st.selectbox("Alert Platform", ["None", "Discord Webhook", "Telegram Bot"])
@@ -73,6 +75,19 @@ def calculate_put_greeks(S, K, T_days, iv):
         return round(delta, 3), round(pop, 1)
     except:
         return 0.0, 50.0
+
+# Helper function to push trade to Google Sheets
+def log_trade_to_google_sheet(sheet_title, row_data):
+    try:
+        scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open(sheet_title)
+        sheet = spreadsheet.get_worksheet(0) # First sheet tab
+        sheet.append_row(row_data)
+        return True, "Successfully logged trade to Google Sheets!"
+    except Exception as e:
+        return False, str(e)
 
 # ==========================================
 # MODE 1: BATCH MARKET SCREENER
@@ -293,7 +308,7 @@ elif scan_mode == "Single Ticker Deep Dive":
                                 st.download_button(
                                     label="📥 Download Options Chain & Sizing (CSV)",
                                     data=chain_csv,
-                                    file_name=f"{selected_ticker}_options_chain.csv",
+                                    file_name=f"{selected_tech_file := selected_ticker}_options_chain.csv",
                                     mime="text/csv",
                                 )
                             else:
@@ -313,5 +328,60 @@ elif scan_mode == "Single Ticker Deep Dive":
                         
                     sim_stock_price = current_price * (1 - (sim_drop / 100.0))
                     st.info(f"If {selected_ticker} drops by {sim_drop}% to **${sim_stock_price:.2f}** with a {sim_iv_spike}% IV spike, short put option values will expand, requiring active management (rolling or assignment).")
+
+                # ==========================================
+                # NEW: GOOGLE SHEETS JOURNAL INTEGRATION
+                # ==========================================
+                with st.expander("📝 Log Trade to Google Sheets Journal", expanded=False):
+                    st.markdown("Push executed trade records straight to your Google Sheets trading tracker.")
+                    
+                    with st.form("journal_form"):
+                        j_sheet_title = st.text_input("Google Sheet Title", value="options_trading_tracker-v5")
+                        col_j1, col_j2, col_j3 = st.columns(3)
+                        with col_j1:
+                            j_trade_id = st.text_input("Trade ID", value="T-015")
+                            j_open_date = st.date_input("Open Date", value=date.today())
+                            j_strategy = st.selectbox("Strategy", ["Cash-Secured Put", "Covered Call"])
+                        with col_j2:
+                            j_option_type = st.selectbox("Option Type", ["Put", "Call"])
+                            j_strike = st.number_input("Strike Price ($)", value=round(support_level, 2))
+                            j_exp_date = st.date_input("Expiration Date", value=date.today())
+                        with col_j3:
+                            j_contracts = st.number_input("Contracts", min_value=1, value=1)
+                            j_premium = st.number_input("Premium per Share ($)", min_value=0.01, value=1.50, step=0.05)
+                            j_notes = st.text_input("Notes / GTC", value="Logged via Streamlit App")
+                        
+                        submit_journal = st.form_submit_button("🚀 Push Trade to Google Sheet")
+                        
+                        if submit_journal:
+                            total_prem = j_premium * j_contracts * 100
+                            collateral = j_strike * j_contracts * 100 if j_option_type == "Put" else current_price * j_contracts * 100
+                            
+                            row_entry = [
+                                j_trade_id,
+                                j_open_date.strftime("%Y-%m-%d"),
+                                selected_ticker,
+                                j_strategy,
+                                j_option_type,
+                                f"${j_strike:.2f}",
+                                j_exp_date.strftime("%Y-%m-%d"),
+                                str((j_exp_date - j_open_date).days),
+                                str(j_contracts),
+                                f"${j_premium:.2f}",
+                                f"${total_prem:.2f}",
+                                f"${collateral:,.2f}",
+                                "$0.01", # Open Fee default
+                                f"${current_price:.2f}",
+                                "0.30", # Default delta or placeholder
+                                f"{current_rsi:.1f}%",
+                                f"RSI {current_rsi:.0f} support test",
+                                "", "Open", "", "", "", "", "", "", j_notes
+                            ]
+                            
+                            success, msg = log_trade_to_google_sheet(j_sheet_title, row_entry)
+                            if success:
+                                st.success(msg)
+                            else:
+                                st.error(f"Failed to log trade: {msg}")
     else:
         st.info("👈 Select your ticker in the sidebar and click **Run Ultimate Scan** to begin deep dive mode.")
