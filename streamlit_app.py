@@ -38,7 +38,14 @@ def send_webhook_alert(url, message):
         st.sidebar.error(f"Alert failed: {e}")
     return False
 
+# Session State to prevent screen wipe on slider adjustments
+if "scanned" not in st.session_state:
+    st.session_state.scanned = False
+
 if st.sidebar.button("Run Ultimate Scan", type="primary"):
+    st.session_state.scanned = True
+
+if st.session_state.scanned:
     with st.spinner(f"Running deep quantitative analysis on {selected_ticker}..."):
         stock = yf.Ticker(selected_ticker)
         hist = stock.history(period="6mo")
@@ -95,7 +102,7 @@ if st.sidebar.button("Run Ultimate Scan", type="primary"):
             else:
                 st.warning("🟡 **Setup WATCH**: Technical criteria not fully aligned or blocked by upcoming earnings.")
             
-            # 3. Options Chain & Position Sizing Calculator with Error Handling
+            # 3. Options Chain & Position Sizing Calculator
             st.subheader("📊 Options Chain & Position Sizing Calculator")
             try:
                 exp_dates = stock.options
@@ -131,7 +138,7 @@ if st.sidebar.button("Run Ultimate Scan", type="primary"):
             except Exception as e:
                 st.warning(f"Unable to fetch live options chain due to Yahoo Finance rate limits: {e}")
 
-            # 4. Interactive What-If Stress Tester (Independent & Always Visible)
+            # 4. Interactive What-If Stress Tester (Persistent via Session State)
             st.subheader("🧪 Interactive 'What-If' Stress Tester (Short Put Simulation)")
             st.caption("Simulate adverse market moves on your portfolio risk.")
             col_s1, col_s2 = st.columns(2)
@@ -142,3 +149,5 @@ if st.sidebar.button("Run Ultimate Scan", type="primary"):
                 
             sim_stock_price = current_price * (1 - (sim_drop / 100.0))
             st.info(f"If {selected_ticker} drops by {sim_drop}% to **${sim_stock_price:.2f}** with a {sim_iv_spike}% IV spike, short put option values will expand, requiring active management (rolling or assignment).")
+else:
+    st.info("👈 Select your ticker in the sidebar and click **Run Ultimate Scan** to begin.")
