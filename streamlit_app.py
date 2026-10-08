@@ -1,349 +1,390 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import requests
-from datetime import datetime, date
+from __future__ import annotations
+
+import logging
 import math
-from scipy.stats import norm
+from datetime import date, datetime
+
+import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import gspread
-from google.oauth2.service_account import Credentials
+import streamlit as st
 
-# Page Configuration (Compact Layout)
-st.set_page_config(page_title="PowerX Pro Ultimate Workstation", layout="wide", initial_sidebar_state="expanded")
+from options_analytics import (
+    calculate_greeks, signed_position_greeks, cash_secured_put_collateral,
+    covered_call_shares_required, contracts_within_budget,
+    short_put_expiration_pnl, option_midpoint, relative_historical_volatility,
+    roll_cashflow,
+)
+from market_data import (
+    get_history, get_expirations, get_option_chain, get_vix,
+    next_earnings_date, option_midpoint_column,
+)
+from journal import get_records, append_trade
 
-st.markdown("### ⚡ PowerX Pro Institutional Options Workstation")
-st.markdown("Portfolio Greeks, Earnings Expected Move, P&L Payoffs, Backtester, IVR, VIX, Roll Simulator, & Journaling.")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ==========================================
-# SIDEBAR: COMPACT CONTROL PANEL & MACRO VIX
-# ==========================================
-st.sidebar.header("⚙️ Control Panel")
+st.set_page_config(
+    page_title="PowerX Options Workstation",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+st.title("⚡ PowerX Options Workstation")
+st.caption(
+    "Personal research tool for options analysis. Quotes may be delayed or incomplete. "
+    "Greeks are theoretical estimates; verify all quotes and orders with your broker."
+)
 
-try:
-    vix_close = yf.Ticker("^VIX").history(period="1d")['Close'].iloc[-1]
-except:
-    vix_close = 18.0
-
-vix_badge = "🟢 Low" if vix_close < 15 else ("🟡 Normal" if vix_close <= 25 else "🔴 High")
-st.sidebar.caption(f"**VIX:** `{vix_close:.2f}` ({vix_badge})")
-
-with st.sidebar.expander("💰 Account & Risk", expanded=True):
-    account_size = st.number_input("Account ($)", min_value=1000.0, value=50000.0, step=1000.0, format="%.0f")
-    max_risk_pct = st.slider("Max Risk/Trade (%)", min_value=1.0, max_value=25.0, value=10.0, step=1.0)
-
-with st.sidebar.expander("🎛️ Technical Settings", expanded=False):
-    hist_period = st.selectbox("Period", ["3mo", "6mo", "1y", "2y"], index=1)
-    rsi_window = st.slider("RSI Window", 5, 30, 14, 1)
-    support_window = st.slider("Support Window (Days)", 10, 100, 20, 5)
-
-with st.sidebar.expander("🔍 Navigation", expanded=True):
-    scan_mode = st.radio("Mode", ["Single Ticker Deep Dive", "⚡ Batch Screener", "🔄 Roll Simulator", "📊 Portfolio Greeks & Journal", "🧪 Backtester & Earnings"])
-    DEFAULT_WATCHLIST = ["VTI", "VOO", "SPY", "QQQ", "MU", "MO", "HD", "AAPL", "NVDA", "TSLA", "AMD"]
-    custom_t = st.sidebar.text_input("Add Ticker", "").upper().strip()
-    if custom_t and custom_t not in DEFAULT_WATCHLIST: DEFAULT_WATCHLIST.append(custom_t)
-    selected_ticker = st.sidebar.selectbox("Target Ticker", DEFAULT_WATCHLIST)
-
-with st.sidebar.expander("🔔 Webhooks", expanded=False):
-    webhook_url = st.sidebar.text_input("Webhook URL", type="password")
-
-def send_alert(url, msg):
-    if not url: return False
-    try:
-        if "discord" in url: return requests.post(url, json={"content": msg}).status_code == 204
-        elif "telegram" in url: return requests.get(url).status_code == 200
-    except: return False
-
-if "scanned" not in st.session_state: st.session_state.scanned = False
-if st.sidebar.button("Run Scan / Refresh", type="primary"): st.session_state.scanned = True
-
-# Helper functions for Greeks & Sheets
-def calculate_greeks(S, K, T_days, iv, opt_type="Put"):
-    if T_days <= 0 or iv <= 0 or S <= 0 or K <= 0: return 0.0, 0.0, 0.0, 50.0
-    T = T_days / 365.0
-    r = 0.045
-    try:
-        d1 = (math.log(S / K) + (r + 0.5 * (iv ** 2)) * T) / (iv * math.sqrt(T))
-        d2 = d1 - iv * math.sqrt(T)
-        nd1 = norm.pdf(d1)
-        if opt_type == "Put":
-            delta = norm.cdf(d1) - 1.0
-            theta = (- (S * nd1 * iv) / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * norm.cdf(-d2)) / 365.0
-        else:
-            delta = norm.cdf(d1)
-            theta = (- (S * nd1 * iv) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * norm.cdf(d2)) / 365.0
-        vega = (S * math.sqrt(T) * nd1) / 100.0
-        pop = (1.0 - abs(delta)) * 100.0
-        return round(delta, 3), round(theta, 2), round(vega, 2), round(pop, 1)
-    except:
-        return 0.0, 0.0, 0.0, 50.0
-
-def get_google_sheet_records(sheet_title):
-    try:
-        scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
-        client = gspread.authorize(creds)
-        return client.open(sheet_title).get_worksheet(0).get_all_records()
-    except:
-        return []
-
-def log_trade(sheet_title, row_data):
-    try:
-        scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
-        client = gspread.authorize(creds)
-        client.open(sheet_title).get_worksheet(0).append_row(row_data)
-        return True, "Successfully logged!"
-    except Exception as e:
-        return False, str(e)
-
-# ==========================================
-# MODE 1: BATCH SCREENER
-# ==========================================
-if scan_mode == "⚡ Batch Screener":
-    st.subheader("⚡ Automated Watchlist Screener")
-    if st.button("Run Batch Scan", type="primary"):
-        res = []
-        bar = st.progress(0)
-        tot = len(DEFAULT_WATCHLIST)
-        for idx, t in enumerate(DEFAULT_WATCHLIST):
-            try:
-                stk = yf.Ticker(t)
-                h = stk.history(period=hist_period)
-                if not h.empty and len(h) >= support_window:
-                    p = h['Close'].iloc[-1]
-                    dp = h['Close'].diff()
-                    rsi = 100 - (100 / (1 + (dp.where(dp>0,0).rolling(rsi_window).mean() / -dp.where(dp<0,0).rolling(rsi_window).mean()))).iloc[-1]
-                    sup = h['Low'].rolling(support_window).min().iloc[-1]
-                    earn = False
-                    try:
-                        cal = stk.calendar
-                        if cal and 'Earnings Date' in cal:
-                            if 0 <= (pd.to_datetime(cal['Earnings Date'][0]).date() - date.today()).days <= 14: earn = True
-                    except: pass
-                    stat = "✅ PASS" if (p <= sup * 1.03 and 30 <= rsi <= 55 and not earn) else ("⚠️ Earnings" if earn else "Watching")
-                    res.append({"Ticker": t, "Price": round(p,2), "RSI": round(rsi,1), "Support": round(sup,2), "Status": stat})
-            except: pass
-            bar.progress((idx + 1) / tot)
-        if res:
-            df = pd.DataFrame(res)
-            st.dataframe(df, use_container_width=True)
-            st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "batch_scan.csv", "text/csv")
-
-# ==========================================
-# MODE 2: ROLL SIMULATOR
-# ==========================================
-elif scan_mode == "🔄 Roll Simulator":
-    st.subheader("🔄 Option Roll Simulator")
-    c1, c2 = st.columns(2)
-    with c1:
-        r_strike = st.number_input("Current Strike ($)", value=150.0)
-        c_debit = st.number_input("Cost to Close ($)", value=0.50)
-    with c2:
-        n_strike = st.number_input("New Strike ($)", value=145.0)
-        n_credit = st.number_input("New Credit ($)", value=2.20)
-    net_c = n_credit - c_debit
-    st.success(f"**Net Roll:** Collect **${net_c:.2f}/share** (${net_c*100:,.2f} total) while moving strike to${n_strike}.")
-
-# ==========================================
-# MODE 3: PORTFOLIO GREEKS & JOURNAL
-# ==========================================
-elif scan_mode == "📊 Portfolio Greeks & Journal":
-    st.subheader("📊 Aggregate Portfolio Greeks & Open Trades")
-    sheet_name = st.text_input("Google Sheet Title", value="options_trading_tracker-v5")
-    records = get_google_sheet_records(sheet_name)
-    
-    if records:
-        df_rec = pd.DataFrame(records)
-        open_trades = df_rec[df_rec['Status'].astype(str).str.lower() == 'open'] if 'Status' in df_rec.columns else pd.DataFrame()
-        
-        if not open_trades.empty:
-            tot_delta, tot_theta, tot_vega = 0.0, 0.0, 0.0
-            for _, row in open_trades.iterrows():
-                try:
-                    s_ticker = str(row.get('Ticker', 'AAPL'))
-                    strike = float(str(row.get('Strike Price', '0')).replace('$', '').replace(',', ''))
-                    contracts = int(float(str(row.get('Contracts', '1'))))
-                    o_type = str(row.get('Option Type', 'Put'))
-                    exp_str = str(row.get('Expiration Date', str(date.today())))
-                    dte = max(1, (datetime.strptime(exp_str[:10], "%Y-%m-%d").date() - date.today()).days)
-                    
-                    stk_info = yf.Ticker(s_ticker).history(period="1d")
-                    cur_p = stk_info['Close'].iloc[-1] if not stk_info.empty else strike
-                    iv = 0.30
-                    
-                    d, th, vg, _ = calculate_greeks(cur_p, strike, dte, iv, o_type)
-                    multiplier = 100 * contracts * (-1 if o_type=="Put" else 1) # short put delta is negative exposure adjustment
-                    tot_delta += d * contracts * 100
-                    tot_theta += th * contracts * 100
-                    tot_vega += vg * contracts * 100
-                except:
-                    pass
-            
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("Aggregate Delta", f"{tot_delta:.1f}")
-            mc2.metric("Aggregate Theta ($/day)", f"${tot_theta:,.2f}")
-            mc3.metric("Aggregate Vega", f"{tot_vega:.1f}")
-            
-            st.markdown("##### Open Journal Positions")
-            st.dataframe(open_trades, use_container_width=True)
-        else:
-            st.info("No open positions found in the Google Sheet.")
+with st.sidebar:
+    st.header("Control Panel")
+    vix = get_vix()
+    if vix is None:
+        st.caption("VIX: unavailable")
     else:
-        st.warning("Could not connect or fetch records from the specified Google Sheet.")
+        label = "Low" if vix < 15 else ("Normal" if vix <= 25 else "High")
+        st.metric("VIX (latest available close)", f"{vix:.2f}", label)
 
-# ==========================================
-# MODE 4: BACKTESTER & EARNINGS
-# ==========================================
-elif scan_mode == "🧪 Backtester & Earnings":
-    st.subheader("🧪 Strategy Backtester & Earnings Expected Move")
-    c_bt1, c_bt2 = st.columns(2)
-    with c_bt1:
-        bt_ticker = st.text_input("Backtest Ticker", value="AAPL")
-    with c_bt2:
-        bt_years = st.selectbox("Historical Span", ["1y", "2y", "5y"], index=1)
-        
-    if st.button("Run Historical Backtest"):
-        with st.spinner(f"Running simulation for {bt_ticker}..."):
-            bt_hist = yf.Ticker(bt_ticker).history(period=bt_years)
-            if not bt_hist.empty:
-                bt_hist['Delta'] = bt_hist['Close'].diff()
-                bt_hist['RSI'] = 100 - (100 / (1 + (bt_hist['Delta'].where(bt_hist['Delta']>0,0).rolling(14).mean() / -bt_hist['Delta'].where(bt_hist['Delta']<0,0).rolling(14).mean())))
-                bt_hist['Support'] = bt_hist['Low'].rolling(20).min()
-                
-                signals = bt_hist[(bt_hist['Close'] <= bt_hist['Support'] * 1.03) & (bt_hist['RSI'].between(30, 55))]
-                wins = 0
-                total_trades = len(signals)
-                
-                for idx, row in signals.iterrows():
-                    loc_idx = bt_hist.index.get_loc(idx)
-                    if loc_idx + 20 < len(bt_hist):
-                        exit_p = bt_hist['Close'].iloc[loc_idx + 20]
-                        if exit_p >= row['Close'] * 0.98: # won or survived pullback
-                            wins += 1
-                
-                win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-                st.success(f"**Backtest Results for {bt_ticker}:** Tested {total_trades} historical pullback signals over {bt_years}. **Win Rate (20D survival):** `{win_rate:.1f}%`")
+    account_size = st.number_input("Account value ($)", min_value=0.0, value=50000.0, step=1000.0)
+    max_trade_pct = st.slider("Maximum CSP collateral budget (% of account)", 1, 100, 10)
+    hist_period = st.selectbox("Historical period", ["3mo", "6mo", "1y", "2y"], index=1)
+    rsi_window = st.slider("RSI window", 5, 30, 14)
+    support_window = st.slider("Support window (trading days)", 10, 100, 20)
+    ticker = st.text_input("Ticker", value="VTI").strip().upper()
+    mode = st.radio(
+        "Workspace",
+        ["Ticker Analysis", "Option Chain & Sizing", "Portfolio Greeks & Journal",
+         "Roll Simulator", "Stock Signal Study"],
+    )
+    if st.button("Clear cached market data"):
+        st.cache_data.clear()
+        st.rerun()
+
+
+def calculate_rsi(close: pd.Series, window: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    result = 100 - 100 / (1 + rs)
+    result = result.mask((avg_loss == 0) & (avg_gain > 0), 100)
+    result = result.mask((avg_gain == 0) & (avg_loss > 0), 0)
+    result = result.mask((avg_gain == 0) & (avg_loss == 0), 50)
+    return result
+
+
+def validate_ticker(value: str) -> bool:
+    return bool(value) and len(value) <= 15 and all(ch.isalnum() or ch in ".-^=" for ch in value)
+
+
+if not validate_ticker(ticker):
+    st.error("Enter a valid ticker symbol.")
+    st.stop()
+
+if mode == "Ticker Analysis":
+    st.subheader(f"{ticker}: price, technicals, and volatility")
+    try:
+        hist = get_history(ticker, hist_period)
+        if hist.empty or len(hist) < max(support_window, rsi_window + 2):
+            st.warning("Not enough historical data for the selected settings.")
+            st.stop()
+
+        hist = hist.copy()
+        hist["RSI"] = calculate_rsi(hist["Close"], rsi_window)
+        hist["Support"] = hist["Low"].rolling(support_window).min()
+        hist["Resistance"] = hist["High"].rolling(support_window).max()
+        hv = hist["Close"].pct_change().rolling(20).std() * math.sqrt(252)
+        hv_valid = hv.dropna()
+        latest_hv = float(hv_valid.iloc[-1]) if not hv_valid.empty else float("nan")
+        hv_rank = relative_historical_volatility(latest_hv, hv_valid.tolist()) if math.isfinite(latest_hv) else None
+
+        latest = hist.iloc[-1]
+        cols = st.columns(5)
+        cols[0].metric("Latest close", f"${latest['Close']:.2f}")
+        cols[1].metric("RSI", "—" if pd.isna(latest["RSI"]) else f"{latest['RSI']:.1f}")
+        cols[2].metric("Rolling support", "—" if pd.isna(latest["Support"]) else f"${latest['Support']:.2f}")
+        cols[3].metric("Rolling resistance", "—" if pd.isna(latest["Resistance"]) else f"${latest['Resistance']:.2f}")
+        cols[4].metric("Relative historical vol.", "—" if hv_rank is None else f"{hv_rank:.0f}/100")
+
+        st.caption("Relative historical volatility is based on realized volatility; it is not IV rank.")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"], name="Close"))
+        fig.add_trace(go.Scatter(x=hist.index, y=hist["Support"], name="Rolling support", line=dict(dash="dash")))
+        fig.add_trace(go.Scatter(x=hist.index, y=hist["Resistance"], name="Rolling resistance", line=dict(dash="dash")))
+        fig.update_layout(height=450, xaxis_title="Date", yaxis_title="Price ($)", hovermode="x unified")
+        st.plotly_chart(fig, use_container_width=True)
+
+        rsi_fig = go.Figure(go.Scatter(x=hist.index, y=hist["RSI"], name="RSI"))
+        rsi_fig.add_hline(y=30, line_dash="dash")
+        rsi_fig.add_hline(y=70, line_dash="dash")
+        rsi_fig.update_layout(height=220, yaxis_range=[0, 100])
+        st.plotly_chart(rsi_fig, use_container_width=True)
+        earnings = next_earnings_date(ticker)
+        st.info(f"Next earnings date: {earnings.isoformat()}" if earnings else "Earnings date unavailable from Yahoo Finance.")
+    except Exception as exc:
+        logger.exception("Ticker analysis failed")
+        st.error(f"Could not analyze {ticker}: {exc}")
+
+elif mode == "Option Chain & Sizing":
+    st.subheader(f"{ticker}: option chain and cash-secured put sizing")
+    try:
+        hist = get_history(ticker, "5d")
+        if hist.empty:
+            st.error("Underlying price unavailable.")
+            st.stop()
+        spot = float(hist["Close"].dropna().iloc[-1])
+        expirations = get_expirations(ticker)
+        if not expirations:
+            st.warning("No option expirations were returned.")
+            st.stop()
+
+        expiry = st.selectbox("Expiration", list(expirations))
+        option_type = st.radio("Option type", ["Put", "Call"], horizontal=True)
+        calls, puts = get_option_chain(ticker, expiry)
+        chain = puts if option_type == "Put" else calls
+        if chain.empty:
+            st.warning("No contracts returned for this expiration.")
+            st.stop()
+
+        expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+        dte = (expiry_date - date.today()).days
+        if dte <= 0:
+            st.warning("Expiration is today or in the past; theoretical Greeks are omitted.")
+        earnings = next_earnings_date(ticker)
+        if earnings and date.today() <= earnings <= expiry_date:
+            st.warning(f"Earnings may occur before this expiration ({earnings}). Verify the date.")
+
+        chain = chain.copy()
+        chain["Mid"] = option_midpoint_column(chain)
+        budget = account_size * max_trade_pct / 100.0
+        rows = []
+        for _, row in chain.iterrows():
+            strike = float(row["strike"])
+            bid = float(row.get("bid", 0) or 0)
+            ask = float(row.get("ask", 0) or 0)
+            mid = row["Mid"]
+            iv = float(row.get("impliedVolatility", 0) or 0)
+            try:
+                g = calculate_greeks(spot, strike, dte, iv, option_type) if dte > 0 and iv > 0 else None
+            except (ValueError, OverflowError):
+                g = None
+
+            if option_type == "Put":
+                contracts = contracts_within_budget(budget, strike)
+                collateral = cash_secured_put_collateral(strike, contracts)
+                breakeven = strike - (float(mid) if pd.notna(mid) else 0.0)
+                premium_pct = (float(mid) / strike * 100) if pd.notna(mid) and strike else float("nan")
             else:
-                st.error("Insufficient historical data for backtest.")
+                contracts = 0
+                collateral = 0.0
+                breakeven = strike + (float(mid) if pd.notna(mid) else 0.0)
+                premium_pct = (float(mid) / spot * 100) if pd.notna(mid) and spot else float("nan")
+
+            spread_pct = ((ask - bid) / float(mid) * 100) if pd.notna(mid) and float(mid) > 0 and ask >= bid else float("nan")
+            rows.append({
+                "Strike": strike, "Bid": bid, "Ask": ask, "Mid": mid,
+                "Spread % of mid": spread_pct, "IV": iv,
+                "Delta (theoretical)": g.delta if g else None,
+                "Theta / day / share": g.theta if g else None,
+                "Vega / vol point / share": g.vega if g else None,
+                "Gamma / share": g.gamma if g else None,
+                "Premium % reference": premium_pct,
+                "Expiration breakeven": breakeven,
+                "CSP contracts within budget": contracts if option_type == "Put" else "N/A",
+                "CSP collateral": collateral if option_type == "Put" else "N/A",
+                "Volume": row.get("volume", None), "Open interest": row.get("openInterest", None),
+            })
+        result = pd.DataFrame(rows)
+        if option_type == "Put":
+            result = result[result["Strike"] < spot].sort_values("Strike", ascending=False)
+        else:
+            result = result[result["Strike"] >= spot].sort_values("Strike")
+        st.caption(
+            f"Underlying latest available close: ${spot:.2f}. Budget: ${budget:,.0f}. "
+            "CSP sizing reserves strike × 100 × contracts and does not imply suitability."
+        )
+        st.dataframe(result, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download option analysis CSV", result.to_csv(index=False).encode("utf-8"),
+            f"{ticker}_{expiry}_{option_type.lower()}_analysis.csv", "text/csv"
+        )
+    except Exception as exc:
+        logger.exception("Option chain analysis failed")
+        st.error(f"Could not load option chain: {exc}")
+
+elif mode == "Portfolio Greeks & Journal":
+    st.subheader("Portfolio Greeks & Trade Journal")
+    sheet_title = st.text_input("Google Sheet title", value="options_trading_tracker-v5")
+    if st.button("Load open positions", type="primary"):
+        try:
+            records = get_records(sheet_title)
+            df = pd.DataFrame(records)
+            required = {"Ticker", "Strike", "Expiration", "Contracts", "Option Type", "Side", "Status"}
+            missing = required - set(df.columns)
+            if missing:
+                st.error("Journal is missing required columns: " + ", ".join(sorted(missing)))
+            else:
+                open_df = df[df["Status"].astype(str).str.lower().eq("open")].copy()
+                totals = {"delta": 0.0, "theta": 0.0, "vega": 0.0, "gamma": 0.0}
+                detail = []
+                for _, row in open_df.iterrows():
+                    try:
+                        symbol = str(row["Ticker"]).strip().upper()
+                        strike = float(str(row["Strike"]).replace("$", "").replace(",", ""))
+                        contracts = int(float(row["Contracts"]))
+                        opt_type = str(row["Option Type"]).title()
+                        side = str(row["Side"]).title()
+                        expiry = pd.to_datetime(row["Expiration"]).date()
+                        dte = (expiry - date.today()).days
+                        if dte <= 0:
+                            detail.append({"Ticker": symbol, "Warning": "Expired/expiration-day; Greeks omitted"})
+                            continue
+                        h = get_history(symbol, "5d")
+                        if h.empty:
+                            detail.append({"Ticker": symbol, "Warning": "Underlying price unavailable"})
+                            continue
+                        spot = float(h["Close"].dropna().iloc[-1])
+                        iv_field = row.get("IV", None)
+                        try:
+                            iv = float(iv_field)
+                            if iv > 1:
+                                iv /= 100
+                            if not math.isfinite(iv) or iv <= 0:
+                                raise ValueError()
+                        except (TypeError, ValueError):
+                            detail.append({"Ticker": symbol, "Warning": "IV missing; position omitted from totals"})
+                            continue
+                        g = calculate_greeks(spot, strike, dte, iv, opt_type)
+                        pos = signed_position_greeks(g, contracts, side)
+                        for key in totals:
+                            totals[key] += pos[key]
+                        detail.append({
+                            "Ticker": symbol, "Spot": spot, "Strike": strike, "DTE": dte,
+                            "Option Type": opt_type, "Side": side, "Contracts": contracts,
+                            "IV": iv, **pos, "Warning": "",
+                        })
+                    except Exception as exc:
+                        logger.exception("Could not calculate Greeks for journal row")
+                        detail.append({"Ticker": str(row.get("Ticker", "")), "Warning": str(exc)})
+
+                metrics = st.columns(4)
+                metrics[0].metric("Delta (share equivalent)", f"{totals['delta']:.1f}")
+                metrics[1].metric("Theta ($/calendar day)", f"${totals['theta']:.2f}")
+                metrics[2].metric("Vega ($/1 IV point)", f"${totals['vega']:.2f}")
+                metrics[3].metric("Gamma (delta change / $1)", f"{totals['gamma']:.3f}")
+                st.caption("Only positions with valid IV and unexpired options are included. Black-Scholes estimates do not model early exercise.")
+                st.dataframe(pd.DataFrame(detail), use_container_width=True, hide_index=True)
+                st.markdown("#### Journal records")
+                st.dataframe(open_df, use_container_width=True, hide_index=True)
+        except Exception as exc:
+            logger.exception("Journal read failed")
+            st.error(f"Could not load Google Sheet: {exc}")
 
     st.markdown("---")
-    st.markdown("##### 📅 Earnings Expected Move Calculator")
-    e_ticker = st.text_input("Ticker for Earnings Check", value="NVDA")
-    try:
-        e_stock = yf.Ticker(e_ticker)
-        e_price = e_stock.history(period="1d")['Close'].iloc[-1]
-        exps = e_stock.options
-        if exps:
-            chain = e_stock.option_chain(exps[0])
-            atm_put = chain.puts.iloc[(chain.puts['strike'] - e_price).abs().argsort()[:1]]
-            atm_call = chain.calls.iloc[(chain.calls['strike'] - e_price).abs().argsort()[:1]]
-            straddle_price = float(atm_put['lastPrice'].values[0]) + float(atm_call['lastPrice'].values[0])
-            em_pct = (straddle_price / e_price) * 100
-            st.info(f"**{e_ticker} Nearest Expiry Straddle Cost:** `${straddle_price:.2f}` | **Market Priced Expected Move:** `±{em_pct:.1f}%`")
-    except:
-        st.info("Unable to calculate earnings expected move right now.")
-
-# ==========================================
-# MODE 5: SINGLE TICKER DEEP DIVE
-# ==========================================
-elif scan_mode == "Single Ticker Deep Dive":
-    if st.session_state.scanned:
-        with st.spinner(f"Analyzing {selected_ticker}..."):
-            stk = yf.Ticker(selected_ticker)
-            hist = stk.history(period=hist_period)
-            
-            if hist.empty or len(hist) < support_window:
-                st.error(f"Insufficient data for {selected_ticker}.")
+    st.markdown("#### Log a trade")
+    with st.form("trade_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            trade_id = st.text_input("Trade ID")
+            trade_ticker = st.text_input("Ticker", value=ticker).strip().upper()
+            strategy = st.selectbox("Strategy", ["Cash-Secured Put", "Covered Call", "Other"])
+            option_type = st.selectbox("Option type", ["Put", "Call"])
+        with c2:
+            side = st.selectbox("Side", ["Short", "Long"])
+            strike = st.number_input("Strike ($)", min_value=0.01, value=100.0)
+            expiry = st.date_input("Expiration", value=date.today())
+            contracts = st.number_input("Contracts", min_value=1, value=1, step=1)
+        with c3:
+            opened = st.date_input("Opened date", value=date.today())
+            premium = st.number_input("Premium/debit per share ($)", min_value=0.0, value=1.0, step=0.05)
+            underlying_entry = st.number_input("Underlying at entry ($)", min_value=0.0, value=100.0)
+            iv_pct = st.number_input("Implied volatility (%)", min_value=0.1, max_value=500.0, value=30.0, step=1.0)
+            status = st.selectbox("Status", ["Open", "Closed", "Assigned"])
+        notes = st.text_input("Notes")
+        submitted = st.form_submit_button("Save trade")
+        if submitted:
+            if not trade_id.strip() or not validate_ticker(trade_ticker):
+                st.error("Trade ID and a valid ticker are required.")
+            elif expiry < opened:
+                st.error("Expiration cannot be before the opened date.")
             else:
-                price = hist['Close'].iloc[-1]
-                dp = hist['Close'].diff()
-                rsi = 100 - (100 / (1 + (dp.where(dp>0,0).rolling(rsi_window).mean() / -dp.where(dp<0,0).rolling(rsi_window).mean()))).iloc[-1]
-                sup = hist['Low'].rolling(support_window).min().iloc[-1]
-                res = hist['High'].rolling(support_window).max().iloc[-1]
-                
-                # Approx IVR
-                hv = hist['Close'].pct_change().rolling(20).std() * math.sqrt(252)
-                iv_approx = hv.iloc[-1] * 1.25
-                ivr = max(0.0, min(100.0, ((iv_approx - hv.min()) / (hv.max() - hv.min() + 1e-6)) * 100))
+                trade = {
+                    "Trade ID": trade_id.strip(), "Opened Date": opened.isoformat(),
+                    "Ticker": trade_ticker, "Strategy": strategy, "Option Type": option_type,
+                    "Side": side, "Strike": strike, "Expiration": expiry.isoformat(),
+                    "Contracts": int(contracts), "Premium Per Share": premium,
+                    "Total Premium": premium * int(contracts) * 100 * (1 if side == "Short" else -1),
+                    "Underlying At Entry": underlying_entry, "IV": iv_pct / 100.0,
+                    "Status": status, "Notes": notes,
+                }
+                ok, message = append_trade(sheet_title, trade)
+                (st.success if ok else st.error)(message)
 
-                with st.expander(f"📈 Metrics: {selected_ticker}", expanded=True):
-                    c1, c2, c3, c4, c5 = st.columns(5)
-                    c1.metric("Price", f"${price:.2f}")
-                    c2.metric(f"RSI", f"{rsi:.1f}")
-                    c3.metric("Support", f"${sup:.2f}")
-                    c4.metric("Resistance", f"${res:.2f}")
-                    c5.metric("IVR", f"{ivr:.0f}%")
+elif mode == "Roll Simulator":
+    st.subheader("Roll Simulator")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        old_strike = st.number_input("Current strike ($)", min_value=0.01, value=150.0)
+        close_debit = st.number_input("Cost to close per share ($)", min_value=0.0, value=0.50)
+    with c2:
+        new_strike = st.number_input("New strike ($)", min_value=0.01, value=145.0)
+        new_credit = st.number_input("New credit per share ($)", min_value=0.0, value=2.20)
+    with c3:
+        contracts = st.number_input("Contracts", min_value=1, value=1, step=1)
+        fees = st.number_input("Total fees ($)", min_value=0.0, value=0.0)
+    cashflow = roll_cashflow(new_credit, close_debit, int(contracts), fees=fees)
+    st.metric("Incremental roll cash flow", f"${cashflow:,.2f}", "Net credit" if cashflow >= 0 else "Net debit")
+    st.write(f"Strike change: ${new_strike - old_strike:+.2f} per share.")
+    st.caption("This is incremental cash flow only. It does not erase the old position's loss or calculate total trade P&L.")
+    st.warning("Add old/new expiration, original premium, and underlying price before using this as a complete roll decision tool.")
 
-                with st.expander("📉 Price Chart & Payoff Diagram", expanded=True):
-                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
-                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], name='Close', line=dict(color='blue')), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Low'].rolling(support_window).min(), name='Support', line=dict(color='green', dash='dash')), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=hist.index, y=hist['High'].rolling(support_window).max(), name='Resistance', line=dict(color='red', dash='dash')), row=1, col=1)
-                    
-                    dp_rsi = hist['Close'].diff()
-                    rsi_series = 100 - (100 / (1 + (dp_rsi.where(dp_rsi>0,0).rolling(rsi_window).mean() / -dp_rsi.where(dp_rsi<0,0).rolling(rsi_window).mean())))
-                    fig.add_trace(go.Scatter(x=hist.index, y=rsi_series, name='RSI', line=dict(color='purple')), row=2, col=1)
-                    fig.update_layout(height=350, margin=dict(l=5, r=5, t=5, b=5), template="plotly_white", legend=dict(orientation="h", y=1.02, x=1))
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    # Expiration P&L Payoff Diagram for Short Put
-                    st.markdown("##### 📊 Short Put Expiration P&L Payoff Diagram Simulation")
-                    sim_strike = st.number_input("Simulation Strike", value=round(sup, 2))
-                    sim_prem = st.number_input("Simulation Premium Received", value=1.50)
-                    
-                    x_range = [sim_strike * 0.8, sim_strike * 1.2]
-                    prices_sim = [x_range[0] + i * (x_range[1] - x_range[0]) / 50 for i in range(51)]
-                    pnl_sim = [(sim_prem - max(0, sim_strike - p)) * 100 for p in prices_sim]
-                    
-                    payoff_fig = go.Figure()
-                    payoff_fig.add_trace(go.Scatter(x=prices_sim, y=pnl_sim, mode='lines', name='P&L at Expiry', line=dict(color='green', width=2)))
-                    payoff_fig.add_hline(y=0, line_dash="dash", line_color="gray")
-                    payoff_fig.update_layout(height=250, margin=dict(l=5, r=5, t=5, b=5), template="plotly_white", xaxis_title="Stock Price at Expiry ($)", yaxis_title="Profit / Loss ($)")
-                    st.plotly_chart(payoff_fig, use_container_width=True)
-
-                with st.expander("📊 Options Chain & Sizing", expanded=True):
-                    try:
-                        exps = stk.options
-                        if exps:
-                            t_date = st.selectbox("Expiry", exps)
-                            puts = stk.option_chain(t_date).puts
-                            if not puts.empty:
-                                dte = max(1, (datetime.strptime(t_date, "%Y-%m-%d").date() - date.today()).days)
-                                otm = puts[puts['strike'] < sup].copy()
-                                if otm.empty: otm = puts[puts['strike'] < price * 0.95].copy()
-                                if otm.empty: otm = puts.copy()
-                                
-                                otm['Delta'], _, _, otm['PoP_%'] = zip(*[calculate_greeks(price, r['strike'], dte, r.get('impliedVolatility', 0.3), "Put") for _, r in otm.iterrows()])
-                                otm['Yield_%'] = (otm['bid'] / otm['strike']) * 100
-                                max_c = account_size * (max_risk_pct / 100.0)
-                                otm['Contracts'] = (max_c / (otm['strike'] * 100)).astype(int)
-                                otm['Collateral'] = otm['strike'] * otm['Contracts'] * 100
-                                
-                                cols = ['strike', 'bid', 'ask', 'impliedVolatility', 'Delta', 'PoP_%', 'Yield_%', 'Contracts', 'Collateral']
-                                st.dataframe(otm[cols].sort_values(by='bid', ascending=False), use_container_width=True)
-                    except Exception as e:
-                        st.warning(f"Chain error: {e}")
-
-                with st.expander("📝 Log Trade to Google Sheets", expanded=False):
-                    with st.form("j_form"):
-                        sh_title = st.text_input("Sheet Title", value="options_trading_tracker-v5")
-                        j1, j2, j3 = st.columns(3)
-                        with j1:
-                            tid = st.text_input("Trade ID", value="T-016")
-                            strat = st.selectbox("Strategy", ["Cash-Secured Put", "Covered Call"])
-                        with j2:
-                            strike_in = st.number_input("Strike", value=round(sup, 2))
-                            contr = st.number_input("Contracts", value=1, min_value=1)
-                        with j3:
-                            prem_in = st.number_input("Premium", value=1.50)
-                            notes = st.text_input("Notes", value="Workstation log")
-                        
-                        if st.form_submit_button("🚀 Push to Sheet"):
-                            row = [tid, str(date.today()), selected_ticker, strat, "Put", f"${strike_in:.2f}", str(date.today()), "30", str(contr), f"${prem_in:.2f}", f"${prem_in*contr*100:.2f}", f"${strike_in*contr*100:,.2f}", "$0.01", f"${price:.2f}", "0.30", f"{rsi:.1f}%", f"RSI support", "", "Open", "", "", "", "", "", "", notes]
-                            ok, msg = log_trade(sh_title, row)
-                            if ok: st.success(msg)
-                            else: st.error(msg)
-    else:
-        st.info("👈 Select your ticker in the sidebar and click **Run Scan / Refresh**.")
+elif mode == "Stock Signal Study":
+    st.subheader("Stock pullback signal study (not an options backtest)")
+    bt_ticker = st.text_input("Study ticker", value=ticker).strip().upper()
+    years = st.selectbox("Historical span", ["1y", "2y", "5y"], index=1)
+    if st.button("Run signal study", type="primary"):
+        try:
+            hist = get_history(bt_ticker, years)
+            if hist.empty:
+                st.error("No historical data returned.")
+                st.stop()
+            hist = hist.copy()
+            hist["RSI"] = calculate_rsi(hist["Close"], 14)
+            hist["Support"] = hist["Low"].rolling(20).min()
+            # Use next session's close as a conservative, reproducible entry proxy.
+            hist["Entry"] = hist["Close"].shift(-1)
+            hist["Exit"] = hist["Close"].shift(-21)
+            signals = hist[
+                (hist["Close"] <= hist["Support"] * 1.03)
+                & hist["RSI"].between(30, 55)
+                & hist["Entry"].notna()
+                & hist["Close"].shift(-20).notna()
+            ].copy()
+            signals["Exit Price"] = hist["Close"].shift(-20).reindex(signals.index)
+            signals["Return %"] = (signals["Exit Price"] / signals["Entry"] - 1) * 100
+            # De-overlap signals: keep a signal only if at least 20 sessions after prior accepted signal.
+            accepted = []
+            last_loc = -10_000
+            locations = {idx: i for i, idx in enumerate(hist.index)}
+            for idx, row in signals.iterrows():
+                loc = locations[idx]
+                if loc - last_loc >= 20:
+                    accepted.append((idx, row))
+                    last_loc = loc
+            result = pd.DataFrame([row for _, row in accepted])
+            if result.empty:
+                st.info("No qualifying signals with a full forward window.")
+            else:
+                win_rate = (result["Return %"] > 0).mean() * 100
+                avg_return = result["Return %"].mean()
+                st.metric("Non-overlapping signals", len(result))
+                c1, c2 = st.columns(2)
+                c1.metric("Positive 20-session outcomes", f"{win_rate:.1f}%")
+                c2.metric("Average 20-session return", f"{avg_return:.2f}%")
+                st.dataframe(result[["Close", "RSI", "Support", "Entry", "Exit Price", "Return %"]], use_container_width=True)
+                st.download_button("Download signal study CSV", result.to_csv(index=False).encode("utf-8"), "stock_signal_study.csv", "text/csv")
+            st.caption("Exploratory stock-price study only. It does not model options, fees, taxes, or a tradable portfolio.")
+        except Exception as exc:
+            logger.exception("Signal study failed")
+            st.error(f"Study failed: {exc}")
