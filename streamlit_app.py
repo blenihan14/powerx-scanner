@@ -11,61 +11,73 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # Page Configuration
-st.set_page_config(page_title="PowerX Pro Ultimate Scanner", layout="wide")
+st.set_page_config(page_title="PowerX Pro Ultimate Workstation", layout="wide")
 
-st.title("⚡ PowerX Pro Ultimate Options Scanner & Risk Engine")
-st.markdown("Institutional-grade quantitative screening, interactive Plotly charts, Black-Scholes Greeks, ex-dividend risk, and Google Sheets journaling.")
+st.title("⚡ PowerX Pro Options Workstation & Risk Engine")
+st.markdown("Institutional screening, Black-Scholes Greeks, IVR, Macro VIX, Roll Simulator, and Google Sheets journaling.")
 
 # ==========================================
-# SIDEBAR: COLLAPSIBLE CONFIGURATION SECTIONS
+# SIDEBAR: COMPACT CONTROL PANEL & MACRO VIX
 # ==========================================
 st.sidebar.header("⚙️ Control Panel")
 
-with st.sidebar.expander("💰 Account & Risk Parameters", expanded=True):
-    account_size = st.number_input("Total Account Size ($)", min_value=1000.0, value=50000.0, step=1000.0)
-    max_risk_pct = st.slider("Max Capital Allocation per Trade (%)", min_value=1.0, max_value=25.0, value=10.0, step=1.0)
+# Live Macro VIX Barometer
+try:
+    vix_ticker = yf.Ticker("^VIX")
+    vix_hist = vix_ticker.history(period="1d")
+    current_vix = vix_hist['Close'].iloc[-1] if not vix_hist.empty else 18.0
+except:
+    current_vix = 18.0
 
-with st.sidebar.expander("🎛️ Technical Indicator Settings", expanded=False):
-    hist_period = st.selectbox("Historical Data Period", ["3mo", "6mo", "1y", "2y"], index=1)
-    rsi_window = st.slider("RSI Lookback Period", min_value=5, max_value=30, value=14, step=1)
-    support_window = st.slider("Support/Resistance Window (Days)", min_value=10, max_value=100, value=20, step=5)
+if current_vix < 15:
+    vix_status = "🟢 Low Vol (Complacency)"
+elif current_vix <= 25:
+    vix_status = "🟡 Normal Vol"
+else:
+    vix_status = "🔴 High Vol (Fear / Spike)"
+
+st.sidebar.markdown(f"**Live VIX:** `{current_vix:.2f}` | **Regime:** {vix_status}")
+
+with st.sidebar.expander("💰 Account & Risk", expanded=True):
+    account_size = st.number_input("Account Size ($)", min_value=1000.0, value=50000.0, step=1000.0)
+    max_risk_pct = st.slider("Max Capital/Trade (%)", min_value=1.0, max_value=25.0, value=10.0, step=1.0)
+
+with st.sidebar.expander("🎛️ Technical Settings", expanded=False):
+    hist_period = st.selectbox("Data Period", ["3mo", "6mo", "1y", "2y"], index=1)
+    rsi_window = st.slider("RSI Window", min_value=5, max_value=30, value=14, step=1)
+    support_window = st.slider("Support/Resistance (Days)", min_value=10, max_value=100, value=20, step=5)
 
 with st.sidebar.expander("🔍 Scanner Mode & Watchlist", expanded=True):
-    scan_mode = st.radio("Select Mode", ["Single Ticker Deep Dive", "⚡ Batch Market Screener (All Watchlist)"])
+    scan_mode = st.radio("Mode", ["Single Ticker Deep Dive", "⚡ Batch Screener", "🔄 Roll Simulator", "📊 Beta Delta Tracker"])
     DEFAULT_WATCHLIST = ["VTI", "VOO", "SPY", "QQQ", "MU", "MO", "HD", "AAPL", "NVDA", "TSLA", "AMD"]
-    custom_ticker_input = st.sidebar.text_input("Add Custom Ticker", "").upper().strip()
-    if custom_ticker_input and custom_ticker_input not in DEFAULT_WATCHLIST:
-        DEFAULT_WATCHLIST.append(custom_ticker_input)
-    selected_ticker = st.sidebar.selectbox("Select Target Ticker (Single Mode)", DEFAULT_WATCHLIST)
+    custom_ticker = st.text_input("Add Ticker", "").upper().strip()
+    if custom_ticker and custom_ticker not in DEFAULT_WATCHLIST:
+        DEFAULT_WATCHLIST.append(custom_ticker)
+    selected_ticker = st.selectbox("Target Ticker", DEFAULT_WATCHLIST)
 
 with st.sidebar.expander("🔔 Webhook Alerts", expanded=False):
-    notification_type = st.selectbox("Alert Platform", ["None", "Discord Webhook", "Telegram Bot"])
-    webhook_url = st.text_input("Webhook URL / API Endpoint", type="password")
+    notification_type = st.selectbox("Platform", ["None", "Discord Webhook", "Telegram Bot"])
+    webhook_url = st.text_input("Endpoint URL", type="password")
 
 def send_webhook_alert(url, message):
-    if not url:
-        return False
+    if not url: return False
     try:
         if "discord" in url:
-            response = requests.post(url, json={"content": message})
-            return response.status_code == 204
+            return requests.post(url, json={"content": message}).status_code == 204
         elif "telegram" in url:
-            response = requests.get(url)
-            return response.status_code == 200
-    except Exception as e:
-        st.sidebar.error(f"Alert failed: {e}")
-    return False
+            return requests.get(url).status_code == 200
+    except:
+        return False
 
 if "scanned" not in st.session_state:
     st.session_state.scanned = False
 
-if st.sidebar.button("Run Ultimate Scan", type="primary"):
+if st.sidebar.button("Run Scan / Refresh", type="primary"):
     st.session_state.scanned = True
 
-# Helper function for Black-Scholes Put Delta & PoP
+# Helper functions
 def calculate_put_greeks(S, K, T_days, iv):
-    if T_days <= 0 or iv <= 0 or S <= 0 or K <= 0:
-        return 0.0, 50.0
+    if T_days <= 0 or iv <= 0 or S <= 0 or K <= 0: return 0.0, 50.0
     T = T_days / 365.0
     r = 0.045
     try:
@@ -76,30 +88,29 @@ def calculate_put_greeks(S, K, T_days, iv):
     except:
         return 0.0, 50.0
 
-# Helper function to push trade to Google Sheets
 def log_trade_to_google_sheet(sheet_title, row_data):
     try:
         scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
         client = gspread.authorize(creds)
         spreadsheet = client.open(sheet_title)
-        sheet = spreadsheet.get_worksheet(0) # First sheet tab
+        sheet = spreadsheet.get_worksheet(0)
         sheet.append_row(row_data)
-        return True, "Successfully logged trade to Google Sheets!"
+        return True, "Successfully logged trade!"
     except Exception as e:
         return False, str(e)
 
 # ==========================================
 # MODE 1: BATCH MARKET SCREENER
 # ==========================================
-if scan_mode == "⚡ Batch Market Screener (All Watchlist)":
+if scan_mode == "⚡ Batch Screener":
     st.subheader("🌐 Automated Watchlist Screener")
-    st.markdown(f"Scanning all watchlist assets simultaneously using a **{hist_period}** timeframe, **RSI ({rsi_window})**, and **{support_window}-day** support windows.")
+    st.markdown(f"Screening watchlist via **{hist_period}** timeframe, **RSI ({rsi_window})**, and **{support_window}D** support.")
     
-    if st.button("Run Full Batch Scan Now", type="primary"):
+    if st.button("Run Full Batch Scan", type="primary"):
         results = []
         progress_bar = st.progress(0)
-        total_tickers = len(DEFAULT_WATCHLIST)
+        total = len(DEFAULT_WATCHLIST)
         
         for idx, ticker in enumerate(DEFAULT_WATCHLIST):
             try:
@@ -107,281 +118,186 @@ if scan_mode == "⚡ Batch Market Screener (All Watchlist)":
                 hist = stock.history(period=hist_period)
                 if not hist.empty and len(hist) >= support_window:
                     price = hist['Close'].iloc[-1]
-                    delta = hist['Close'].diff()
-                    gain = (delta.where(delta > 0, 0)).rolling(window=rsi_window).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_window).mean()
-                    rs = gain / loss
-                    rsi = 100 - (100 / (1 + rs))
-                    current_rsi = rsi.iloc[-1]
-                    
+                    delta_p = hist['Close'].diff()
+                    gain = (delta_p.where(delta_p > 0, 0)).rolling(window=rsi_window).mean()
+                    loss = (-delta_p.where(delta_p < 0, 0)).rolling(window=rsi_window).mean()
+                    rsi = 100 - (100 / (1 + (gain / loss))).iloc[-1]
                     support = hist['Low'].rolling(window=support_window).min().iloc[-1]
                     
-                    earnings_block = False
+                    earn_block = False
                     try:
                         cal = stock.calendar
                         if cal and 'Earnings Date' in cal:
-                            next_earn = pd.to_datetime(cal['Earnings Date'][0]).date()
-                            if 0 <= (next_earn - date.today()).days <= 14:
-                                earnings_block = True
+                            if 0 <= (pd.to_datetime(cal['Earnings Date'][0]).date() - date.today()).days <= 14:
+                                earn_block = True
                     except:
                         pass
                     
-                    near_sup = price <= (support * 1.03)
-                    pullback_ok = 30 <= current_rsi <= 55
-                    
-                    status = "Watching"
-                    if near_sup and pullback_ok and not earnings_block:
-                        status = "✅ PASS (Setup Active)"
-                    elif earnings_block:
-                        status = "⚠️ Earnings Block"
-                        
-                    results.append({
-                        "Ticker": ticker,
-                        "Price": round(price, 2),
-                        f"RSI ({rsi_window})": round(current_rsi, 2),
-                        f"{support_window}D Support Floor": round(support, 2),
-                        "Earnings Risk": "Yes" if earnings_block else "Clear",
-                        "Scan Status": status
-                    })
-            except Exception:
+                    status = "✅ PASS" if (price <= support * 1.03 and 30 <= rsi <= 55 and not earn_block) else ("⚠️ Earnings" if earn_block else "Watching")
+                    results.append({"Ticker": ticker, "Price": round(price, 2), f"RSI": round(rsi, 2), "Support": round(support, 2), "Status": status})
+            except:
                 pass
-            progress_bar.progress((idx + 1) / total_tickers)
+            progress_bar.progress((idx + 1) / total)
             
         if results:
-            df_results = pd.DataFrame(results)
-            st.dataframe(df_results, use_container_width=True)
-            
-            csv_data = df_results.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download Batch Scan Results (CSV)",
-                data=csv_data,
-                file_name="powerx_batch_scan.csv",
-                mime="text/csv",
-            )
-            
-            passed_df = df_results[df_results["Scan Status"].str.contains("PASS")]
-            if not passed_df.empty:
-                st.success(f"Found {len(passed_df)} qualifying asset(s) ready for review!")
-            else:
-                st.info("No assets currently match the strict criteria on this timeframe.")
+            df_res = pd.DataFrame(results)
+            st.dataframe(df_res, use_container_width=True)
+            st.download_button("📥 Download CSV", data=df_res.to_csv(index=False).encode('utf-8'), file_name="batch_scan.csv", mime="text/csv")
 
 # ==========================================
-# MODE 2: SINGLE TICKER DEEP DIVE
+# MODE 2: ROLL SIMULATOR (MANAGEMENT HELPER)
+# ==========================================
+elif scan_mode == "🔄 Roll Simulator":
+    st.subheader("🔄 Option Roll Simulator")
+    st.markdown("Simulate rolling an active short put or covered call out in time to capture net credits and adjust strike basis.")
+    
+    col_r1, col_r2 = st.columns(2)
+    with col_r1:
+        roll_strike = st.number_input("Current Strike Price ($)", value=150.0)
+        curr_debit = st.number_input("Cost to Buy Back Current Option ($)", value=0.50)
+    with col_r2:
+        new_strike = st.number_input("New Strike Price ($)", value=145.0)
+        new_credit = st.number_input("Credit Received for New Option ($)", value=2.20)
+        
+    net_credit = new_credit - curr_debit
+    st.success(f"**Net Roll Result:** Collect a net credit of **${net_credit:.2f} per share** (${net_credit * 100:,.2f} total per contract) while shifting strike to${new_strike}.")
+
+# ==========================================
+# MODE 3: PORTFOLIO BETA-WEIGHTED DELTA TRACKER
+# ==========================================
+elif scan_mode == "📊 Beta Delta Tracker":
+    st.subheader("📊 Portfolio Beta-Weighted Delta Tracker")
+    st.markdown("Estimate net market directional exposure relative to SPY.")
+    
+    col_b1, col_b2, col_b3 = st.columns(3)
+    with col_b1:
+        p_ticker = st.text_input("Position Ticker", value="AAPL")
+        p_delta = st.number_input("Option Delta", value=-0.25)
+    with col_b2:
+        p_contracts = st.number_input("Contracts", value=2, min_value=1)
+        p_beta = st.number_input("Beta vs SPY", value=1.2)
+    with col_b3:
+        spy_price = st.number_input("Current SPY Price ($)", value=580.0)
+        
+    beta_weighted_delta = p_delta * p_contracts * 100 * p_beta
+    spy_equiv_shares = beta_weighted_delta / (spy_price / 100) # approximation context
+    
+    st.info(f"**Net Beta-Weighted Delta:** `{beta_weighted_delta:.1f}` | Equivalent to holding approx. `{int(beta_weighted_delta)}` shares of SPY.")
+
+# ==========================================
+# MODE 4: SINGLE TICKER DEEP DIVE
 # ==========================================
 elif scan_mode == "Single Ticker Deep Dive":
     if st.session_state.scanned:
-        with st.spinner(f"Running deep quantitative analysis on {selected_ticker} ({hist_period})..."):
+        with st.spinner(f"Analyzing {selected_ticker}..."):
             stock = yf.Ticker(selected_ticker)
             hist = stock.history(period=hist_period)
             
             if hist.empty or len(hist) < support_window:
-                st.error(f"Insufficient historical data retrieved for {selected_ticker} using period {hist_period}.")
+                st.error(f"Insufficient historical data for {selected_ticker}.")
             else:
-                current_price = hist['Close'].iloc[-1]
-                delta_price = hist['Close'].diff()
-                gain = (delta_price.where(delta_price > 0, 0)).rolling(window=rsi_window).mean()
-                loss = (-delta_price.where(delta_price < 0, 0)).rolling(window=rsi_window).mean()
-                rs = gain / loss
-                hist['RSI'] = 100 - (100 / (1 + rs))
-                
+                price = hist['Close'].iloc[-1]
+                delta_p = hist['Close'].diff()
+                gain = (delta_p.where(delta_p > 0, 0)).rolling(window=rsi_window).mean()
+                loss = (-delta_p.where(delta_p < 0, 0)).rolling(window=rsi_window).mean()
+                hist['RSI'] = 100 - (100 / (1 + (gain / loss)))
                 hist['Support'] = hist['Low'].rolling(window=support_window).min()
                 hist['Resistance'] = hist['High'].rolling(window=support_window).max()
                 
-                current_rsi = hist['RSI'].iloc[-1]
-                support_level = hist['Support'].iloc[-1]
-                resistance_level = hist['Resistance'].iloc[-1]
+                rsi = hist['RSI'].iloc[-1]
+                support = hist['Support'].iloc[-1]
+                resistance = hist['Resistance'].iloc[-1]
                 
-                earnings_warning = False
+                # Approximate IVR/IV Percentile using rolling volatility
+                hist['Returns'] = hist['Close'].pct_change()
+                hist['HistVol'] = hist['Returns'].rolling(20).std() * math.sqrt(252)
+                current_iv_approx = hist['HistVol'].iloc[-1] * 1.25 # proxy
+                hv_min, hv_max = hist['HistVol'].min(), hist['HistVol'].max()
+                ivr = max(0.0, min(100.0, ((current_iv_approx - hv_min) / (hv_max - hv_min + 1e-6)) * 100))
+
+                earn_warn = False
                 try:
-                    calendar = stock.calendar
-                    if calendar and 'Earnings Date' in calendar:
-                        next_earnings = pd.to_datetime(calendar['Earnings Date'][0]).date()
-                        days_to_earnings = (next_earnings - date.today()).days
-                        if 0 <= days_to_earnings <= 14:
-                            earnings_warning = True
+                    cal = stock.calendar
+                    if cal and 'Earnings Date' in cal:
+                        if 0 <= (pd.to_datetime(cal['Earnings Date'][0]).date() - date.today()).days <= 14:
+                            earn_warn = True
                 except:
                     pass
 
-                ex_div_date_str = "None found"
-                ex_div_warning = False
+                ex_div_str = "None"
+                ex_div_warn = False
                 try:
-                    info = stock.info
-                    ex_timestamp = info.get('exDividendDate')
-                    if ex_timestamp:
-                        ex_date = pd.to_datetime(ex_timestamp, unit='s').date()
-                        ex_div_date_str = ex_date.strftime('%Y-%m-%d')
-                        if 0 <= (ex_date - date.today()).days <= 30:
-                            ex_div_warning = True
+                    ts = stock.info.get('exDividendDate')
+                    if ts:
+                        ex_d = pd.to_datetime(ts, unit='s').date()
+                        ex_div_str = ex_d.strftime('%Y-%m-%d')
+                        if 0 <= (ex_d - date.today()).days <= 30:
+                            ex_div_warn = True
                 except:
                     pass
 
-                with st.expander(f"📈 Technical Indicators & Metrics: {selected_ticker}", expanded=True):
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Live Market Price", f"${current_price:.2f}")
-                    col2.metric(f"RSI ({rsi_window})", f"{current_rsi:.2f}")
-                    col3.metric(f"{support_window}D Support Floor", f"${support_level:.2f}")
-                    col4.metric(f"{support_window}D Resistance Ceiling", f"${resistance_level:.2f}")
+                with st.expander(f"📈 Metrics & Signals: {selected_ticker}", expanded=True):
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    c1.metric("Price", f"${price:.2f}")
+                    c2.metric(f"RSI ({rsi_window})", f"{rsi:.1f}")
+                    c3.metric("Support", f"${support:.2f}")
+                    c4.metric("Resistance", f"${resistance:.2f}")
+                    c5.metric("IVR (Approx)", f"{ivr:.0f}%")
                     
-                    if earnings_warning:
-                        st.error("🚨 **EARNINGS CATALYST WARNING**: This asset reports earnings within the next 14 days. Avoid selling options through binary events!")
-                    
-                    if ex_div_warning:
-                        st.warning(f"⚠️ **EX-DIVIDEND WARNING**: Ex-dividend date is **{ex_div_date_str}**. Covered call traders face early assignment risk if ITM!")
-                    else:
-                        st.info(f"📅 Next Ex-Dividend Date: {ex_div_date_str}")
+                    if earn_warn: st.error("🚨 Earnings within 14 days!")
+                    if ex_div_warn: st.warning(f"⚠️ Ex-Dividend date approaching ({ex_div_str})!")
 
-                    near_support = current_price <= (support_level * 1.03)
-                    rsi_pullback = 30 <= current_rsi <= 55
-                    
-                    if near_support and rsi_pullback and not earnings_warning:
-                        pass_msg = f"🟢 **Setup PASSED**: {selected_ticker} is testing support with clean pullback momentum."
-                        st.success(pass_msg)
-                        if notification_type != "None" and webhook_url:
-                            send_webhook_alert(webhook_url, f"PowerX Alert: {pass_msg} Price: ${current_price:.2f}")
-                    else:
-                        st.warning("🟡 **Setup WATCH**: Technical criteria not fully aligned or blocked by upcoming earnings.")
-
-                with st.expander(f"📉 Interactive Price & RSI Chart ({selected_ticker})", expanded=True):
-                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                        vertical_spacing=0.05, row_heights=[0.7, 0.3])
-                    
-                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], mode='lines', name='Close Price', line=dict(color='blue', width=2)), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Support'], mode='lines', name=f'{support_window}D Support', line=dict(color='green', dash='dash')), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Resistance'], mode='lines', name=f'{support_window}D Resistance', line=dict(color='red', dash='dash')), row=1, col=1)
-                    
-                    fig.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], mode='lines', name=f'RSI ({rsi_window})', line=dict(color='purple', width=1.5)), row=2, col=1)
-                    fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
-                    fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
-                    
-                    fig.update_layout(height=500, margin=dict(l=10, r=10, t=10, b=10), template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                with st.expander(f"📉 Price & RSI Chart", expanded=True):
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], name='Close', line=dict(color='blue')), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Support'], name='Support', line=dict(color='green', dash='dash')), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Resistance'], name='Resistance', line=dict(color='red', dash='dash')), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], name='RSI', line=dict(color='purple')), row=2, col=1)
+                    fig.update_layout(height=400, margin=dict(l=5, r=5, t=5, b=5), template="plotly_white", legend=dict(orientation="h", y=1.02, x=1))
                     st.plotly_chart(fig, use_container_width=True)
 
-                with st.expander("📊 Options Chain, Delta & Position Sizing Calculator", expanded=True):
+                with st.expander("📊 Options Chain & Position Sizing", expanded=True):
                     try:
                         exp_dates = stock.options
-                        if exp_dates and len(exp_dates) > 0:
-                            target_date = st.selectbox("Select Expiration Date", exp_dates, key="target_exp_date")
-                            opt_chain = stock.option_chain(target_date)
-                            puts = opt_chain.puts
-                            
+                        if exp_dates:
+                            target_date = st.selectbox("Expiry", exp_dates)
+                            puts = stock.option_chain(target_date).puts
                             if not puts.empty:
-                                exp_dt = datetime.strptime(target_date, "%Y-%m-%d").date()
-                                dte = (exp_dt - date.today()).days
-                                if dte <= 0:
-                                    dte = 1
-                                    
-                                otm_puts = puts[puts['strike'] < support_level].copy()
-                                if otm_puts.empty:
-                                    otm_puts = puts[puts['strike'] < current_price * 0.95].copy()
-                                if otm_puts.empty:
-                                    otm_puts = puts.copy()
-                                    
-                                deltas = []
-                                pops = []
-                                for idx, row in otm_puts.iterrows():
-                                    iv = row.get('impliedVolatility', 0.3)
-                                    if pd.isna(iv) or iv == 0:
-                                        iv = 0.3
-                                    d, p = calculate_put_greeks(current_price, row['strike'], dte, iv)
-                                    deltas.append(d)
-                                    pops.append(p)
-                                    
-                                otm_puts['Delta'] = deltas
-                                otm_puts['PoP_%'] = pops
-                                otm_puts['Yield_%'] = (otm_puts['bid'] / otm_puts['strike']) * 100
+                                dte = max(1, (datetime.strptime(target_date, "%Y-%m-%d").date() - date.today()).days)
+                                otm = puts[puts['strike'] < support].copy()
+                                if otm.empty: otm = puts[puts['strike'] < price * 0.95].copy()
+                                if otm.empty: otm = puts.copy()
                                 
-                                max_capital_allowed = account_size * (max_risk_pct / 100.0)
-                                otm_puts['Max_Contracts'] = (max_capital_allowed / (otm_puts['strike'] * 100)).astype(int)
-                                otm_puts['Total_Collateral'] = otm_puts['strike'] * otm_puts['Max_Contracts'] * 100
-                                otm_puts['Potential_Premium'] = otm_puts['bid'] * otm_puts['Max_Contracts'] * 100
+                                otm['Delta'], otm['PoP_%'] = zip(*[calculate_put_greeks(price, r['strike'], dte, r.get('impliedVolatility', 0.3)) for _, r in otm.iterrows()])
+                                otm['Yield_%'] = (otm['bid'] / otm['strike']) * 100
+                                max_cap = account_size * (max_risk_pct / 100.0)
+                                otm['Max_Contracts'] = (max_cap / (otm['strike'] * 100)).astype(int)
+                                otm['Collateral'] = otm['strike'] * otm['Max_Contracts'] * 100
                                 
-                                display_cols = ['strike', 'bid', 'ask', 'impliedVolatility', 'Delta', 'PoP_%', 'volume', 'Yield_%', 'Max_Contracts', 'Total_Collateral', 'Potential_Premium']
-                                
-                                st.caption(f"Calculated for max risk allocation: **${max_capital_allowed:,.2f}** ({max_risk_pct}% of account) | DTE: {dte} days")
-                                
-                                st.dataframe(
-                                    otm_puts[display_cols].sort_values(by='bid', ascending=False),
-                                    use_container_width=True
-                                )
-                                
-                                chain_csv = otm_puts[display_cols].to_csv(index=False).encode('utf-8')
-                                st.download_button(
-                                    label="📥 Download Options Chain & Sizing (CSV)",
-                                    data=chain_csv,
-                                    file_name=f"{selected_tech_file := selected_ticker}_options_chain.csv",
-                                    mime="text/csv",
-                                )
-                            else:
-                                st.info("Yahoo Finance returned an empty options chain for this ticker right now.")
-                        else:
-                            st.info("No active option expiration dates found via Yahoo Finance for this ticker.")
+                                cols = ['strike', 'bid', 'ask', 'impliedVolatility', 'Delta', 'PoP_%', 'Yield_%', 'Max_Contracts', 'Collateral']
+                                st.dataframe(otm[cols].sort_values(by='bid', ascending=False), use_container_width=True)
+                                st.download_button("📥 Download Chain CSV", data=otm[cols].to_csv(index=False).encode('utf-8'), file_name=f"{selected_ticker}_chain.csv", mime="text/csv")
                     except Exception as e:
-                        st.warning(f"Unable to fetch live options chain due to Yahoo Finance rate limits: {e}")
+                        st.warning(f"Options chain error: {e}")
 
-                with st.expander("🧪 Interactive 'What-If' Stress Tester (Short Put Simulation)", expanded=True):
-                    st.caption("Simulate adverse market moves on your portfolio risk.")
-                    col_s1, col_s2 = st.columns(2)
-                    with col_s1:
-                        sim_drop = st.slider("Simulate Stock Price Drop (%)", 0.0, 30.0, 10.0, 1.0, key="sim_drop_slider")
-                    with col_s2:
-                        sim_iv_spike = st.slider("Simulate IV Spike (%)", 0.0, 100.0, 20.0, 5.0, key="sim_iv_slider")
+                with st.expander("📝 Log Trade to Google Sheets", expanded=False):
+                    with st.form("j_form"):
+                        sh_title = st.text_input("Sheet Title", value="options_trading_tracker-v5")
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            t_id = st.text_input("Trade ID", value="T-015")
+                            strat = st.selectbox("Strategy", ["Cash-Secured Put", "Covered Call"])
+                        with c2:
+                            strike = st.number_input("Strike", value=round(support, 2))
+                            contracts = st.number_input("Contracts", value=1, min_value=1)
+                        with c3:
+                            prem = st.number_input("Premium/Share", value=1.50)
+                            notes = st.text_input("Notes", value="Logged via Streamlit")
                         
-                    sim_stock_price = current_price * (1 - (sim_drop / 100.0))
-                    st.info(f"If {selected_ticker} drops by {sim_drop}% to **${sim_stock_price:.2f}** with a {sim_iv_spike}% IV spike, short put option values will expand, requiring active management (rolling or assignment).")
-
-                # ==========================================
-                # NEW: GOOGLE SHEETS JOURNAL INTEGRATION
-                # ==========================================
-                with st.expander("📝 Log Trade to Google Sheets Journal", expanded=False):
-                    st.markdown("Push executed trade records straight to your Google Sheets trading tracker.")
-                    
-                    with st.form("journal_form"):
-                        j_sheet_title = st.text_input("Google Sheet Title", value="options_trading_tracker-v5")
-                        col_j1, col_j2, col_j3 = st.columns(3)
-                        with col_j1:
-                            j_trade_id = st.text_input("Trade ID", value="T-015")
-                            j_open_date = st.date_input("Open Date", value=date.today())
-                            j_strategy = st.selectbox("Strategy", ["Cash-Secured Put", "Covered Call"])
-                        with col_j2:
-                            j_option_type = st.selectbox("Option Type", ["Put", "Call"])
-                            j_strike = st.number_input("Strike Price ($)", value=round(support_level, 2))
-                            j_exp_date = st.date_input("Expiration Date", value=date.today())
-                        with col_j3:
-                            j_contracts = st.number_input("Contracts", min_value=1, value=1)
-                            j_premium = st.number_input("Premium per Share ($)", min_value=0.01, value=1.50, step=0.05)
-                            j_notes = st.text_input("Notes / GTC", value="Logged via Streamlit App")
-                        
-                        submit_journal = st.form_submit_button("🚀 Push Trade to Google Sheet")
-                        
-                        if submit_journal:
-                            total_prem = j_premium * j_contracts * 100
-                            collateral = j_strike * j_contracts * 100 if j_option_type == "Put" else current_price * j_contracts * 100
-                            
-                            row_entry = [
-                                j_trade_id,
-                                j_open_date.strftime("%Y-%m-%d"),
-                                selected_ticker,
-                                j_strategy,
-                                j_option_type,
-                                f"${j_strike:.2f}",
-                                j_exp_date.strftime("%Y-%m-%d"),
-                                str((j_exp_date - j_open_date).days),
-                                str(j_contracts),
-                                f"${j_premium:.2f}",
-                                f"${total_prem:.2f}",
-                                f"${collateral:,.2f}",
-                                "$0.01", # Open Fee default
-                                f"${current_price:.2f}",
-                                "0.30", # Default delta or placeholder
-                                f"{current_rsi:.1f}%",
-                                f"RSI {current_rsi:.0f} support test",
-                                "", "Open", "", "", "", "", "", "", j_notes
-                            ]
-                            
-                            success, msg = log_trade_to_google_sheet(j_sheet_title, row_entry)
-                            if success:
-                                st.success(msg)
-                            else:
-                                st.error(f"Failed to log trade: {msg}")
+                        if st.form_submit_button("🚀 Push to Sheet"):
+                            row = [t_id, str(date.today()), selected_ticker, strat, "Put", f"${strike:.2f}", str(date.today()), "30", str(contracts), f"${prem:.2f}", f"${prem*contracts*100:.2f}", f"${strike*contracts*100:,.2f}", "$0.01", f"${price:.2f}", "0.30", f"{rsi:.1f}%", f"RSI support", "", "Open", "", "", "", "", "", "", notes]
+                            success, msg = log_trade_to_google_sheet(sh_title, row)
+                            if success: st.success(msg)
+                            else: st.error(msg)
     else:
-        st.info("👈 Select your ticker in the sidebar and click **Run Ultimate Scan** to begin deep dive mode.")
+        st.info("👈 Select your ticker in the sidebar and click **Run Scan / Refresh**.")
