@@ -8,7 +8,7 @@ from datetime import datetime, date
 st.set_page_config(page_title="PowerX Pro Ultimate Scanner", layout="wide")
 
 st.title("⚡ PowerX Pro Ultimate Options Scanner & Risk Engine")
-st.markdown("Advanced quantitative screening, risk sizing, earnings blockers, stress testing, and batch market scanning.")
+st.markdown("Advanced quantitative screening, risk sizing, earnings blockers, stress testing, and adjustable technical timeframes.")
 
 # ==========================================
 # SIDEBAR: CONFIGURATION & RISK SETTINGS
@@ -17,12 +17,16 @@ st.sidebar.header("⚙️ Account & Risk Parameters")
 account_size = st.sidebar.number_input("Total Account Size ($)", min_value=1000.0, value=50000.0, step=1000.0)
 max_risk_pct = st.sidebar.slider("Max Capital Allocation per Trade (%)", min_value=1.0, max_value=25.0, value=10.0, step=1.0)
 
+st.sidebar.header("🎛️ Technical Indicator Settings")
+hist_period = st.sidebar.selectbox("Historical Data Period", ["3mo", "6mo", "1y", "2y"], index=1)
+rsi_window = st.sidebar.slider("RSI Lookback Period", min_value=5, max_value=30, value=14, step=1)
+support_window = st.sidebar.slider("Support/Resistance Window (Days)", min_value=10, max_value=100, value=20, step=5)
+
 st.sidebar.header("🔍 Scanner Mode & Watchlist")
 scan_mode = st.sidebar.radio("Select Mode", ["Single Ticker Deep Dive", "⚡ Batch Market Screener (All Watchlist)"])
 
 DEFAULT_WATCHLIST = ["VTI", "VOO", "SPY", "QQQ", "MU", "MO", "HD", "AAPL", "NVDA", "TSLA", "AMD"]
 
-# Custom Ticker Option
 custom_ticker_input = st.sidebar.text_input("Add Custom Ticker (Optional)", "").upper().strip()
 if custom_ticker_input and custom_ticker_input not in DEFAULT_WATCHLIST:
     DEFAULT_WATCHLIST.append(custom_ticker_input)
@@ -47,7 +51,6 @@ def send_webhook_alert(url, message):
         st.sidebar.error(f"Alert failed: {e}")
     return False
 
-# Session State initialization
 if "scanned" not in st.session_state:
     st.session_state.scanned = False
 
@@ -59,7 +62,7 @@ if st.sidebar.button("Run Ultimate Scan", type="primary"):
 # ==========================================
 if scan_mode == "⚡ Batch Market Screener (All Watchlist)":
     st.subheader("🌐 Automated Watchlist Screener")
-    st.markdown("Scanning all watchlist assets simultaneously for active RSI pullbacks, support tests, and earnings safety.")
+    st.markdown(f"Scanning all watchlist assets simultaneously using a **{hist_period}** timeframe, **RSI ({rsi_window})**, and **{support_window}-day** support windows.")
     
     if st.button("Run Full Batch Scan Now", type="primary"):
         results = []
@@ -69,19 +72,18 @@ if scan_mode == "⚡ Batch Market Screener (All Watchlist)":
         for idx, ticker in enumerate(DEFAULT_WATCHLIST):
             try:
                 stock = yf.Ticker(ticker)
-                hist = stock.history(period="6mo")
-                if not hist.empty:
+                hist = stock.history(period=hist_period)
+                if not hist.empty and len(hist) >= support_window:
                     price = hist['Close'].iloc[-1]
                     delta = hist['Close'].diff()
-                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                    gain = (delta.where(delta > 0, 0)).rolling(window=rsi_window).mean()
+                    loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_window).mean()
                     rs = gain / loss
                     rsi = 100 - (100 / (1 + rs))
                     current_rsi = rsi.iloc[-1]
                     
-                    support = hist['Low'].rolling(window=20).min().iloc[-1]
+                    support = hist['Low'].rolling(window=support_window).min().iloc[-1]
                     
-                    # Earnings check
                     earnings_block = False
                     try:
                         cal = stock.calendar
@@ -104,8 +106,8 @@ if scan_mode == "⚡ Batch Market Screener (All Watchlist)":
                     results.append({
                         "Ticker": ticker,
                         "Price": round(price, 2),
-                        "RSI (14)": round(current_rsi, 2),
-                        "Support Floor": round(support, 2),
+                        f"RSI ({rsi_window})": round(current_rsi, 2),
+                        f"{support_window}D Support Floor": round(support, 2),
                         "Earnings Risk": "Yes" if earnings_block else "Clear",
                         "Scan Status": status
                     })
@@ -121,29 +123,29 @@ if scan_mode == "⚡ Batch Market Screener (All Watchlist)":
             if not passed_df.empty:
                 st.success(f"Found {len(passed_df)} qualifying asset(s) ready for review!")
             else:
-                st.info("No assets currently match the strict RSI pullback and support criteria today.")
+                st.info("No assets currently match the strict criteria on this timeframe.")
 
 # ==========================================
 # MODE 2: SINGLE TICKER DEEP DIVE
 # ==========================================
 elif scan_mode == "Single Ticker Deep Dive":
     if st.session_state.scanned:
-        with st.spinner(f"Running deep quantitative analysis on {selected_ticker}..."):
+        with st.spinner(f"Running deep quantitative analysis on {selected_ticker} ({hist_period})..."):
             stock = yf.Ticker(selected_ticker)
-            hist = stock.history(period="6mo")
+            hist = stock.history(period=hist_period)
             
-            if hist.empty:
-                st.error(f"Could not retrieve historical data for {selected_ticker}.")
+            if hist.empty or len(hist) < support_window:
+                st.error(f"Insufficient historical data retrieved for {selected_ticker} using period {hist_period}.")
             else:
                 current_price = hist['Close'].iloc[-1]
                 delta = hist['Close'].diff()
-                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                gain = (delta.where(delta > 0, 0)).rolling(window=rsi_window).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_window).mean()
                 rs = gain / loss
                 hist['RSI'] = 100 - (100 / (1 + rs))
                 
-                hist['Support'] = hist['Low'].rolling(window=20).min()
-                hist['Resistance'] = hist['High'].rolling(window=20).max()
+                hist['Support'] = hist['Low'].rolling(window=support_window).min()
+                hist['Resistance'] = hist['High'].rolling(window=support_window).max()
                 
                 current_rsi = hist['RSI'].iloc[-1]
                 support_level = hist['Support'].iloc[-1]
@@ -162,9 +164,9 @@ elif scan_mode == "Single Ticker Deep Dive":
 
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Live Market Price", f"${current_price:.2f}")
-                col2.metric("RSI (14)", f"{current_rsi:.2f}")
-                col3.metric("20D Support Floor", f"${support_level:.2f}")
-                col4.metric("20D Resistance Ceiling", f"${resistance_level:.2f}")
+                col2.metric(f"RSI ({rsi_window})", f"{current_rsi:.2f}")
+                col3.metric(f"{support_window}D Support Floor", f"${support_level:.2f}")
+                col4.metric(f"{support_window}D Resistance Ceiling", f"${resistance_level:.2f}")
                 
                 if earnings_warning:
                     st.error("🚨 **EARNINGS CATALYST WARNING**: This asset reports earnings within the next 14 days. Avoid selling options through binary events!")
