@@ -1,0 +1,88 @@
+"""Yahoo Finance data access with defensive validation and caching."""
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+
+logger = logging.getLogger(__name__)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_history(ticker: str, period: str = "6mo") -> pd.DataFrame:
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise ValueError("Enter a ticker.")
+    hist = yf.Ticker(ticker).history(period=period, auto_adjust=False)
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    required = {"Close", "High", "Low"}
+    if not required.issubset(hist.columns):
+        raise ValueError(f"Historical data for {ticker} is missing required columns.")
+    return hist.dropna(subset=["Close"])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_expirations(ticker: str) -> tuple[str, ...]:
+    return tuple(yf.Ticker(ticker.strip().upper()).options or ())
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_option_chain(ticker: str, expiration: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    chain = yf.Ticker(ticker.strip().upper()).option_chain(expiration)
+    calls = chain.calls.copy() if chain.calls is not None else pd.DataFrame()
+    puts = chain.puts.copy() if chain.puts is not None else pd.DataFrame()
+    return calls, puts
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_vix() -> float | None:
+    try:
+        data = yf.Ticker("^VIX").history(period="5d")
+        if data.empty or "Close" not in data:
+            return None
+        return float(data["Close"].dropna().iloc[-1])
+    except Exception:
+        logger.exception("Unable to retrieve VIX.")
+        return None
+
+
+def next_earnings_date(ticker: str) -> date | None:
+    """Best-effort earnings date lookup; Yahoo's calendar schema can vary."""
+    try:
+        cal = yf.Ticker(ticker.strip().upper()).calendar
+        if cal is None or getattr(cal, "empty", False):
+            return None
+        values = []
+        if isinstance(cal, pd.DataFrame):
+            for col in cal.columns:
+                if "earnings" in str(col).lower():
+                    values.extend(list(cal[col].dropna()))
+            if not values:
+                for idx in cal.index:
+                    if "earnings" in str(idx).lower():
+                        values.extend(list(cal.loc[idx].dropna()))
+        elif isinstance(cal, dict):
+            for key, value in cal.items():
+                if "earnings" in str(key).lower():
+                    values.extend(value if isinstance(value, (list, tuple)) else [value])
+        for value in values:
+            ts = pd.to_datetime(value, errors="coerce")
+            if pd.notna(ts):
+                return ts.date()
+    except Exception:
+        logger.exception("Unable to retrieve earnings date for %s", ticker)
+    return None
+
+
+def option_midpoint_column(df: pd.DataFrame) -> pd.Series:
+    """Add a midpoint column only where bid/ask quotes are valid."""
+    if df.empty:
+        return pd.Series(dtype="float64", index=df.index)
+    bid = pd.to_numeric(df.get("bid"), errors="coerce")
+    ask = pd.to_numeric(df.get("ask"), errors="coerce")
+    valid = bid.notna() & ask.notna() & (bid >= 0) & (ask >= bid) & ((bid > 0) | (ask > 0))
+    midpoint = (bid + ask) / 2.0
+    return midpoint.where(valid)
