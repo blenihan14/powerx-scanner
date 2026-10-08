@@ -4,3 +4,5 @@ pandas
 requests
 plotly
 scipy
+gspread
+google-auth
