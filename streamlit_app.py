@@ -8,34 +8,33 @@ from datetime import datetime, date
 st.set_page_config(page_title="PowerX Pro Ultimate Scanner", layout="wide")
 
 st.title("⚡ PowerX Pro Ultimate Options Scanner & Risk Engine")
-st.markdown("Advanced quantitative screening, risk sizing, earnings blockers, stress testing, and adjustable technical timeframes.")
+st.markdown("Modular quantitative screening, risk sizing, earnings blockers, stress testing, and collapsible feature blocks.")
 
 # ==========================================
-# SIDEBAR: CONFIGURATION & RISK SETTINGS
+# SIDEBAR: COLLAPSIBLE CONFIGURATION SECTIONS
 # ==========================================
-st.sidebar.header("⚙️ Account & Risk Parameters")
-account_size = st.sidebar.number_input("Total Account Size ($)", min_value=1000.0, value=50000.0, step=1000.0)
-max_risk_pct = st.sidebar.slider("Max Capital Allocation per Trade (%)", min_value=1.0, max_value=25.0, value=10.0, step=1.0)
+st.sidebar.header("⚙️ Control Panel")
 
-st.sidebar.header("🎛️ Technical Indicator Settings")
-hist_period = st.sidebar.selectbox("Historical Data Period", ["3mo", "6mo", "1y", "2y"], index=1)
-rsi_window = st.sidebar.slider("RSI Lookback Period", min_value=5, max_value=30, value=14, step=1)
-support_window = st.sidebar.slider("Support/Resistance Window (Days)", min_value=10, max_value=100, value=20, step=5)
+with st.sidebar.expander("💰 Account & Risk Parameters", expanded=True):
+    account_size = st.number_input("Total Account Size ($)", min_value=1000.0, value=50000.0, step=1000.0)
+    max_risk_pct = st.slider("Max Capital Allocation per Trade (%)", min_value=1.0, max_value=25.0, value=10.0, step=1.0)
 
-st.sidebar.header("🔍 Scanner Mode & Watchlist")
-scan_mode = st.sidebar.radio("Select Mode", ["Single Ticker Deep Dive", "⚡ Batch Market Screener (All Watchlist)"])
+with st.sidebar.expander("🎛️ Technical Indicator Settings", expanded=False):
+    hist_period = st.selectbox("Historical Data Period", ["3mo", "6mo", "1y", "2y"], index=1)
+    rsi_window = st.slider("RSI Lookback Period", min_value=5, max_value=30, value=14, step=1)
+    support_window = st.slider("Support/Resistance Window (Days)", min_value=10, max_value=100, value=20, step=5)
 
-DEFAULT_WATCHLIST = ["VTI", "VOO", "SPY", "QQQ", "MU", "MO", "HD", "AAPL", "NVDA", "TSLA", "AMD"]
+with st.sidebar.expander("🔍 Scanner Mode & Watchlist", expanded=True):
+    scan_mode = st.radio("Select Mode", ["Single Ticker Deep Dive", "⚡ Batch Market Screener (All Watchlist)"])
+    DEFAULT_WATCHLIST = ["VTI", "VOO", "SPY", "QQQ", "MU", "MO", "HD", "AAPL", "NVDA", "TSLA", "AMD"]
+    custom_ticker_input = st.text_input("Add Custom Ticker", "").upper().strip()
+    if custom_ticker_input and custom_ticker_input not in DEFAULT_WATCHLIST:
+        DEFAULT_WATCHLIST.append(custom_ticker_input)
+    selected_ticker = st.selectbox("Select Target Ticker (Single Mode)", DEFAULT_WATCHLIST)
 
-custom_ticker_input = st.sidebar.text_input("Add Custom Ticker (Optional)", "").upper().strip()
-if custom_ticker_input and custom_ticker_input not in DEFAULT_WATCHLIST:
-    DEFAULT_WATCHLIST.append(custom_ticker_input)
-
-selected_ticker = st.sidebar.selectbox("Select Target Ticker (Single Mode)", DEFAULT_WATCHLIST)
-
-st.sidebar.header("🔔 Webhook Alerts")
-notification_type = st.sidebar.selectbox("Alert Platform", ["None", "Discord Webhook", "Telegram Bot"])
-webhook_url = st.sidebar.text_input("Webhook URL / API Endpoint", type="password")
+with st.sidebar.expander("🔔 Webhook Alerts", expanded=False):
+    notification_type = st.selectbox("Alert Platform", ["None", "Discord Webhook", "Telegram Bot"])
+    webhook_url = st.text_input("Webhook URL / API Endpoint", type="password")
 
 def send_webhook_alert(url, message):
     if not url:
@@ -126,7 +125,7 @@ if scan_mode == "⚡ Batch Market Screener (All Watchlist)":
                 st.info("No assets currently match the strict criteria on this timeframe.")
 
 # ==========================================
-# MODE 2: SINGLE TICKER DEEP DIVE
+# MODE 2: SINGLE TICKER DEEP DIVE WITH EXPANDERS
 # ==========================================
 elif scan_mode == "Single Ticker Deep Dive":
     if st.session_state.scanned:
@@ -162,70 +161,74 @@ elif scan_mode == "Single Ticker Deep Dive":
                 except:
                     pass
 
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Live Market Price", f"${current_price:.2f}")
-                col2.metric(f"RSI ({rsi_window})", f"{current_rsi:.2f}")
-                col3.metric(f"{support_window}D Support Floor", f"${support_level:.2f}")
-                col4.metric(f"{support_window}D Resistance Ceiling", f"${resistance_level:.2f}")
-                
-                if earnings_warning:
-                    st.error("🚨 **EARNINGS CATALYST WARNING**: This asset reports earnings within the next 14 days. Avoid selling options through binary events!")
-
-                near_support = current_price <= (support_level * 1.03)
-                rsi_pullback = 30 <= current_rsi <= 55
-                
-                if near_support and rsi_pullback and not earnings_warning:
-                    pass_msg = f"🟢 **Setup PASSED**: {selected_ticker} is testing support with clean pullback momentum."
-                    st.success(pass_msg)
-                    if notification_type != "None" and webhook_url:
-                        send_webhook_alert(webhook_url, f"PowerX Alert: {pass_msg} Price: ${current_price:.2f}")
-                else:
-                    st.warning("🟡 **Setup WATCH**: Technical criteria not fully aligned or blocked by upcoming earnings.")
-                
-                st.subheader("📊 Options Chain & Position Sizing Calculator")
-                try:
-                    exp_dates = stock.options
-                    if exp_dates and len(exp_dates) > 0:
-                        target_date = exp_dates[0]
-                        opt_chain = stock.option_chain(target_date)
-                        puts = opt_chain.puts
-                        
-                        if not puts.empty:
-                            otm_puts = puts[puts['strike'] < support_level].copy()
-                            if otm_puts.empty:
-                                otm_puts = puts[puts['strike'] < current_price * 0.95].copy()
-                            if otm_puts.empty:
-                                otm_puts = puts.copy()
-                                
-                            otm_puts['Yield_%'] = (otm_puts['bid'] / otm_puts['strike']) * 100
-                            max_capital_allowed = account_size * (max_risk_pct / 100.0)
-                            otm_puts['Max_Contracts'] = (max_capital_allowed / (otm_puts['strike'] * 100)).astype(int)
-                            otm_puts['Total_Collateral'] = otm_puts['strike'] * otm_puts['Max_Contracts'] * 100
-                            otm_puts['Potential_Premium'] = otm_puts['bid'] * otm_puts['Max_Contracts'] * 100
-                            
-                            display_cols = ['strike', 'bid', 'ask', 'impliedVolatility', 'volume', 'Yield_%', 'Max_Contracts', 'Total_Collateral', 'Potential_Premium']
-                            
-                            st.caption(f"Calculated for max risk allocation: **${max_capital_allowed:,.2f}** ({max_risk_pct}% of account) | Expiry: {target_date}")
-                            st.dataframe(
-                                otm_puts[display_cols].sort_values(by='bid', ascending=False),
-                                use_container_width=True
-                            )
-                        else:
-                            st.info("Yahoo Finance returned an empty options chain for this ticker right now.")
-                    else:
-                        st.info("No active option expiration dates found via Yahoo Finance for this ticker.")
-                except Exception as e:
-                    st.warning(f"Unable to fetch live options chain due to Yahoo Finance rate limits: {e}")
-
-                st.subheader("🧪 Interactive 'What-If' Stress Tester (Short Put Simulation)")
-                st.caption("Simulate adverse market moves on your portfolio risk.")
-                col_s1, col_s2 = st.columns(2)
-                with col_s1:
-                    sim_drop = st.slider("Simulate Stock Price Drop (%)", 0.0, 30.0, 10.0, 1.0)
-                with col_s2:
-                    sim_iv_spike = st.slider("Simulate IV Spike (%)", 0.0, 100.0, 20.0, 5.0)
+                # Section 1: Technical Metrics & Status (Collapsible)
+                with st.expander(f"📈 Technical Indicators & Metrics: {selected_ticker}", expanded=True):
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Live Market Price", f"${current_price:.2f}")
+                    col2.metric(f"RSI ({rsi_window})", f"{current_rsi:.2f}")
+                    col3.metric(f"{support_window}D Support Floor", f"${support_level:.2f}")
+                    col4.metric(f"{support_window}D Resistance Ceiling", f"${resistance_level:.2f}")
                     
-                sim_stock_price = current_price * (1 - (sim_drop / 100.0))
-                st.info(f"If {selected_ticker} drops by {sim_drop}% to **${sim_stock_price:.2f}** with a {sim_iv_spike}% IV spike, short put option values will expand, requiring active management (rolling or assignment).")
+                    if earnings_warning:
+                        st.error("🚨 **EARNINGS CATALYST WARNING**: This asset reports earnings within the next 14 days. Avoid selling options through binary events!")
+
+                    near_support = current_price <= (support_level * 1.03)
+                    rsi_pullback = 30 <= current_rsi <= 55
+                    
+                    if near_support and rsi_pullback and not earnings_warning:
+                        pass_msg = f"🟢 **Setup PASSED**: {selected_ticker} is testing support with clean pullback momentum."
+                        st.success(pass_msg)
+                        if notification_type != "None" and webhook_url:
+                            send_webhook_alert(webhook_url, f"PowerX Alert: {pass_msg} Price: ${current_price:.2f}")
+                    else:
+                        st.warning("🟡 **Setup WATCH**: Technical criteria not fully aligned or blocked by upcoming earnings.")
+
+                # Section 2: Options Chain & Position Sizing Calculator (Collapsible)
+                with st.expander("📊 Options Chain & Position Sizing Calculator", expanded=True):
+                    try:
+                        exp_dates = stock.options
+                        if exp_dates and len(exp_dates) > 0:
+                            target_date = exp_dates[0]
+                            opt_chain = stock.option_chain(target_date)
+                            puts = opt_chain.puts
+                            
+                            if not puts.empty:
+                                otm_puts = puts[puts['strike'] < support_level].copy()
+                                if otm_puts.empty:
+                                    otm_puts = puts[puts['strike'] < current_price * 0.95].copy()
+                                if otm_puts.empty:
+                                    otm_puts = puts.copy()
+                                    
+                                otm_puts['Yield_%'] = (otm_puts['bid'] / otm_puts['strike']) * 100
+                                max_capital_allowed = account_size * (max_risk_pct / 100.0)
+                                otm_puts['Max_Contracts'] = (max_capital_allowed / (otm_puts['strike'] * 100)).astype(int)
+                                otm_puts['Total_Collateral'] = otm_puts['strike'] * otm_puts['Max_Contracts'] * 100
+                                otm_puts['Potential_Premium'] = otm_puts['bid'] * otm_puts['Max_Contracts'] * 100
+                                
+                                display_cols = ['strike', 'bid', 'ask', 'impliedVolatility', 'volume', 'Yield_%', 'Max_Contracts', 'Total_Collateral', 'Potential_Premium']
+                                
+                                st.caption(f"Calculated for max risk allocation: **${max_capital_allowed:,.2f}** ({max_risk_pct}% of account) | Expiry: {target_date}")
+                                st.dataframe(
+                                    otm_puts[display_cols].sort_values(by='bid', ascending=False),
+                                    use_container_width=True
+                                )
+                            else:
+                                st.info("Yahoo Finance returned an empty options chain for this ticker right now.")
+                        else:
+                            st.info("No active option expiration dates found via Yahoo Finance for this ticker.")
+                    except Exception as e:
+                        st.warning(f"Unable to fetch live options chain due to Yahoo Finance rate limits: {e}")
+
+                # Section 3: Interactive What-If Stress Tester (Collapsible)
+                with st.expander("🧪 Interactive 'What-If' Stress Tester (Short Put Simulation)", expanded=True):
+                    st.caption("Simulate adverse market moves on your portfolio risk.")
+                    col_s1, col_s2 = st.columns(2)
+                    with col_s1:
+                        sim_drop = st.slider("Simulate Stock Price Drop (%)", 0.0, 30.0, 10.0, 1.0, key="sim_drop_slider")
+                    with col_s2:
+                        sim_iv_spike = st.slider("Simulate IV Spike (%)", 0.0, 100.0, 20.0, 5.0, key="sim_iv_slider")
+                        
+                    sim_stock_price = current_price * (1 - (sim_drop / 100.0))
+                    st.info(f"If {selected_ticker} drops by {sim_drop}% to **${sim_stock_price:.2f}** with a {sim_iv_spike}% IV spike, short put option values will expand, requiring active management (rolling or assignment).")
     else:
         st.info("👈 Select your ticker in the sidebar and click **Run Ultimate Scan** to begin deep dive mode.")
